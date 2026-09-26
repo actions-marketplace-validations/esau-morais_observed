@@ -18,9 +18,18 @@ import {
   checkName,
   commentMarker,
   DeliveryError,
+  findComment,
   postCheckRun,
-  upsertComment,
+  writeComment,
 } from './github-delivery';
+import {
+  callSlack,
+  readSlackState,
+  slackAction,
+  slackMessage,
+  SlackError,
+  writeSlackState,
+} from './slack-delivery';
 import { describeRevision, shortSource } from '../src/provenance-text';
 import { describeVisual } from '../src/visual-text';
 import {
@@ -288,7 +297,7 @@ export function deliveryNote(options: {
   }
 
   if (options.untrustedSource) {
-    return 'No GitHub check or pull request comment was posted: pull requests from forks and Dependabot receive no secrets.';
+    return 'Nothing was posted to GitHub or Slack: pull requests from forks and Dependabot receive no secrets.';
   }
 
   if (!options.configured) {
@@ -296,8 +305,35 @@ export function deliveryNote(options: {
   }
 
   return options.tokenOutcome === 'failure'
-    ? 'No GitHub check or pull request comment was posted: the GitHub App token could not be created. The job log has details.'
-    : 'No GitHub check or pull request comment was posted: the GitHub App client ID or private key is missing.';
+    ? 'Nothing was posted: the GitHub App token could not be created. The job log has details.'
+    : 'Nothing was posted: the GitHub App client ID or private key, or the Slack bot token, is missing.';
+}
+
+export function slackSkipReason(options: {
+  token: string;
+  channel: string;
+  pullRequest: number | null;
+  lookupFailed: boolean;
+}): string | null {
+  if (options.token === '' && options.channel === '') {
+    return null;
+  }
+
+  if (options.token === '' || options.channel === '') {
+    return 'Slack: set both slack-bot-token and slack-channel';
+  }
+
+  if (!/^[CGD][A-Z0-9]+$/.test(options.channel)) {
+    return 'Slack: slack-channel must be a channel ID such as C0123456789';
+  }
+
+  if (options.pullRequest === null) {
+    return 'Slack: posts only for pull requests';
+  }
+
+  return options.lookupFailed
+    ? 'Slack: skipped because the earlier message could not be looked up'
+    : null;
 }
 
 export function capturedRevision(
@@ -441,12 +477,13 @@ if (import.meta.main) {
     if (identity === 'other') {
       await writeOutput(
         'note',
-        `No GitHub check or pull request comment was posted: the candidate capture is not pull request head ${headSha.slice(0, 7)} or its merge commit.`,
+        `Nothing was posted to GitHub or Slack: the candidate capture is not pull request head ${headSha.slice(0, 7)} or its merge commit.`,
       );
       process.exit(0);
     }
 
     const pullRequest = Number(environment('OBSERVED_PULL_REQUEST'));
+    const runUrl = `${repository ?? ''}/actions/runs/${environment('GITHUB_RUN_ID')}`;
     const target = {
       api:
         environment('GITHUB_API_URL') === ''
@@ -457,64 +494,161 @@ if (import.meta.main) {
       headSha,
       pullRequest:
         Number.isInteger(pullRequest) && pullRequest > 0 ? pullRequest : null,
-      detailsUrl: Schema.is(httpsUrlSchema)(page)
-        ? page
-        : `${repository ?? ''}/actions/runs/${environment('GITHUB_RUN_ID')}`,
+      detailsUrl: Schema.is(httpsUrlSchema)(page) ? page : runUrl,
       botLogin: `${environment('OBSERVED_APP_SLUG')}[bot]`,
     };
-    const attempt = async (
+    const github = target.token !== '';
+    const slackToken = environment('OBSERVED_SLACK_BOT_TOKEN');
+    const slackChannel = environment('OBSERVED_SLACK_CHANNEL');
+    const notes: string[] = [];
+    const attempt = async <A>(
       label: string,
-      post: () => Promise<string | null>,
-    ) => {
+      send: () => Promise<A>,
+    ): Promise<A | null> => {
       try {
-        const url = await post();
-
-        return url === null ? null : (link(label, url) ?? label);
+        return await send();
       } catch (error) {
         const reason =
-          error instanceof DeliveryError
+          error instanceof DeliveryError || error instanceof SlackError
             ? error.message
             : 'an unexpected error';
 
         process.stdout.write(
           `::warning title=Observed::Posting the ${label} failed: ${reason}\n`,
         );
+        notes.push(`the ${label} failed (${reason})`);
 
-        return `the ${label} failed (${reason})`;
+        return null;
       }
     };
 
     const name = checkName(artifact);
-    const check = await attempt('GitHub check', () =>
-      postCheckRun(target, {
-        name,
-        title: summary.title,
-        markdown: summarize({
-          output,
-          exitCode: Option.getOrNull(
-            Schema.decodeUnknownOption(exitCodeSchema)(exitCode),
-          ),
-          artifact,
-          page: page === '' ? null : page,
-          repository,
-          headline: false,
-        }).markdown,
-        conclusion: checkConclusion(summary.kind),
-      }),
-    );
-    const comment = await attempt('pull request comment', () =>
-      upsertComment(
-        target,
-        commentMarker(artifact),
-        name === 'Observed'
-          ? summary.markdown
-          : `<sub>${inlineText(name)}</sub>\n\n${summary.markdown}`,
-      ),
-    );
+    const marker = commentMarker(artifact);
+    const checkUrl = github
+      ? await attempt('GitHub check', () =>
+          postCheckRun(target, {
+            name,
+            title: summary.title,
+            markdown: summarize({
+              output,
+              exitCode: Option.getOrNull(
+                Schema.decodeUnknownOption(exitCodeSchema)(exitCode),
+              ),
+              artifact,
+              page: page === '' ? null : page,
+              repository,
+              headline: false,
+            }).markdown,
+            conclusion: checkConclusion(summary.kind),
+          }),
+        )
+      : null;
+    const lookup = github
+      ? await attempt('pull request comment', async () => ({
+          comment: await findComment(target, marker),
+        }))
+      : null;
+    const lookupFailed = github && lookup === null;
+    const existing = lookup?.comment ?? null;
+    let slackState = readSlackState(existing?.body ?? null);
+
+    const slackSkip = slackSkipReason({
+      token: slackToken,
+      channel: slackChannel,
+      pullRequest: target.pullRequest,
+      lookupFailed,
+    });
+
+    if (slackSkip !== null) {
+      notes.push(slackSkip);
+    } else if (slackToken !== '') {
+      const failing = checkConclusion(summary.kind) === 'failure';
+      const action = slackAction(slackState, slackChannel, failing);
+      const message = slackMessage(
+        summary.trusted && Option.isSome(decoded) ? decoded.value.result : null,
+        {
+          name,
+          pullRequest:
+            target.pullRequest === null || repository === null
+              ? null
+              : `${repository}/pull/${String(target.pullRequest)}`,
+          pullRequestLabel:
+            target.pullRequest === null
+              ? target.repository
+              : `${target.repository}#${String(target.pullRequest)}`,
+          report: Schema.is(httpsUrlSchema)(page) ? page : null,
+          check: checkUrl,
+          run: runUrl,
+        },
+      );
+
+      if (action === 'none') {
+        notes.push('Slack: nothing sent for a result that is not failing');
+      } else {
+        const sent = await attempt('Slack message', () =>
+          action === 'post' || slackState === null
+            ? callSlack('chat.postMessage', slackToken, {
+                channel: slackChannel,
+                ...message,
+                unfurl_links: false,
+                unfurl_media: false,
+              })
+            : callSlack('chat.update', slackToken, {
+                channel: slackState.channel,
+                ts: slackState.ts,
+                ...message,
+              }).catch((error: unknown) => {
+                if (error instanceof SlackError && error.gone && failing) {
+                  return callSlack('chat.postMessage', slackToken, {
+                    channel: slackChannel,
+                    ...message,
+                    unfurl_links: false,
+                    unfurl_media: false,
+                  });
+                }
+
+                throw error;
+              }),
+        );
+
+        if (sent !== null) {
+          slackState = { channel: sent.channel, ts: sent.ts, failing };
+          notes.push(
+            action === 'post'
+              ? 'Slack: posted a message'
+              : 'Slack: updated the earlier message',
+          );
+        }
+      }
+    }
+
+    const commentUrl =
+      github && !lookupFailed
+        ? await attempt('pull request comment', () =>
+            writeComment(
+              target,
+              existing,
+              marker,
+              [
+                ...(slackState === null ? [] : [writeSlackState(slackState)]),
+                ...(name === 'Observed'
+                  ? []
+                  : [`<sub>${inlineText(name)}</sub>`, '']),
+                summary.markdown,
+              ].join('\n'),
+            ),
+          )
+        : null;
 
     await writeOutput(
       'note',
-      `GitHub delivery: ${[check, comment].filter((item) => item !== null).join('; ')}.`,
+      `Delivery: ${[
+        link('GitHub check', checkUrl),
+        link('pull request comment', commentUrl),
+        ...notes,
+      ]
+        .filter((item) => item !== null)
+        .join('; ')}.`,
     );
   } else if (command === 'summary' && args.length === 4) {
     const [resultFile = '', exitCode = '', artifact = '', page = ''] = args;
