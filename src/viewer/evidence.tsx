@@ -1,7 +1,7 @@
 import * as stylex from '@stylexjs/stylex';
 import { createContext, use, useState, type ReactNode } from 'react';
 import type { Side, Visual, VisualRegion } from '../comparison-model';
-import { describeRevision } from '../provenance-text';
+import { describeRevision, shortSource } from '../provenance-text';
 import { describeStatus } from '../request-text';
 import { describeRegion } from '../visual-text';
 import { fonts, geometry, media } from './constants.stylex';
@@ -179,58 +179,59 @@ export function Screenshot({
       <h2 {...stylex.props(styles.heading)}>{label}</h2>
       <p {...stylex.props(styles.caption)}>
         {capture?.label ?? 'No capture'}
-        {capture === null
-          ? ''
-          : ` · ${describeRevision(capture.source.revision)} · ${capture.source.sha256.slice(0, 12)}`}
+        {capture === null ? null : (
+          <>
+            {' · '}
+            <span
+              title={describeRevision(capture.source.revision)}
+              {...stylex.props(styles.mono)}
+            >
+              {shortSource(capture.source)}
+            </span>
+          </>
+        )}
       </p>
       {side.screenshot === null ? (
         <p {...stylex.props(styles.missing)}>
           Screenshot unavailable. See unresolved evidence.
         </p>
       ) : (
-        <>
-          <a
-            href={resolve(side.screenshot)}
-            {...stylex.props(styles.link, styles.imageLink)}
-          >
-            {failed ? (
-              <p {...stylex.props(styles.missing)}>
-                Image could not be displayed. Open original screenshot.
-              </p>
-            ) : (
-              <span {...stylex.props(styles.frame)}>
-                <img
-                  src={resolve(side.screenshot)}
-                  alt={`${label} captured application. Open full-size screenshot.`}
-                  loading="eager"
-                  onError={() => setFailed(true)}
-                  {...stylex.props(styles.image)}
+        <a
+          href={resolve(side.screenshot)}
+          {...stylex.props(styles.link, styles.imageLink)}
+        >
+          {failed ? (
+            <p {...stylex.props(styles.missing)}>
+              Image could not be displayed. Open original screenshot.
+            </p>
+          ) : (
+            <span {...stylex.props(styles.frame)}>
+              <img
+                src={resolve(side.screenshot)}
+                alt={`${label} captured application. Open full-size screenshot.`}
+                loading="eager"
+                onError={() => setFailed(true)}
+                {...stylex.props(styles.image)}
+              />
+              {highlight?.regions.map((region, index) => (
+                <span
+                  key={index}
+                  aria-hidden="true"
+                  data-region=""
+                  {...stylex.props(
+                    styles.region,
+                    styles.regionBox(
+                      percent(region.x, highlight.width),
+                      percent(region.y, highlight.height),
+                      percent(region.width, highlight.width),
+                      percent(region.height, highlight.height),
+                    ),
+                  )}
                 />
-                {highlight?.regions.map((region, index) => (
-                  <span
-                    key={index}
-                    aria-hidden="true"
-                    data-region=""
-                    {...stylex.props(
-                      styles.region,
-                      styles.regionBox(
-                        percent(region.x, highlight.width),
-                        percent(region.y, highlight.height),
-                        percent(region.width, highlight.width),
-                        percent(region.height, highlight.height),
-                      ),
-                    )}
-                  />
-                ))}
-              </span>
-            )}
-          </a>
-          <figcaption {...stylex.props(styles.caption)}>
-            <EvidenceLink href={side.screenshot}>
-              Open {label.toLowerCase()} screenshot at full size
-            </EvidenceLink>
-          </figcaption>
-        </>
+              ))}
+            </span>
+          )}
+        </a>
       )}
     </figure>
   );

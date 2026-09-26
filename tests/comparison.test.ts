@@ -738,7 +738,7 @@ test.each([
 
     expect(result.conclusion.kind).toBe(conclusion);
 
-    expect(result.conclusion.text).toContain('Revision comparison unavailable');
+    expect(result.conclusion.text).toContain('The revisions were not compared');
   },
 );
 
@@ -832,6 +832,19 @@ test.each([
       { passed: 'preview', failed: 'check-failed', unknown: 'unavailable' }[
         expected
       ],
+    );
+    const compared = compareCaptures({
+      visual: pixelsNotInspected,
+      base: candidate,
+      candidate,
+      evaluatedAt,
+    });
+    expect(compared.conclusion.kind).toBe(
+      {
+        passed: 'no-regression',
+        failed: 'check-failed',
+        unknown: 'unavailable',
+      }[expected],
     );
   },
 );

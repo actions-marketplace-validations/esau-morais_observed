@@ -1,3 +1,4 @@
+import { checkLabels, conclusionLabels, executionLabels } from './result-text';
 import type { Comparison, Side, Visual } from './comparison-model';
 import { describeObserved, describeRevision } from './provenance-text';
 import { describeStatus } from './request-text';
@@ -26,7 +27,7 @@ function list(values: readonly string[]): string {
 
 function renderIdentity(side: Side, label: string): string {
   if (side.capture === null) {
-    return `### ${label}\n\nCapture unavailable.\n\nExecution: ${side.execution}.`;
+    return `### ${label}\n\nCapture unavailable.\n\nCapture: ${executionLabels[side.execution]}.`;
   }
 
   const capture = side.capture.manifest;
@@ -37,7 +38,7 @@ function renderIdentity(side: Side, label: string): string {
     `- Full snapshot SHA-256: ${escapeText(capture.source.sha256)}`,
     `- Capture started (UTC): ${escapeText(capture.startedAt)}`,
     `- Capture finished (UTC): ${escapeText(capture.finishedAt)}`,
-    `- Execution: ${side.execution}`,
+    `- Capture: ${executionLabels[side.execution]}`,
   ].join('\n\n');
 }
 
@@ -46,7 +47,7 @@ function renderCheck(side: Side, label: string): string {
 
   return [
     `### ${label}: ${escapeText(check.name)}`,
-    `**${check.outcome}** · ${escapeText(check.authority)}`,
+    `**${checkLabels[check.outcome]}** · ${escapeText(check.authority)}`,
     escapeText(check.detail),
     [
       `- Expectation: ${escapeText(check.expectation)}`,
@@ -220,14 +221,6 @@ export function renderComparison(result: Comparison): string {
           { side: result.base, label: 'Before' },
           { side: result.candidate, label: 'After' },
         ];
-  const conclusionLabels = {
-    regression: 'Regression',
-    'no-regression': 'No regression',
-    unavailable: 'Conclusion unavailable',
-    'not-checked': 'Visual comparison',
-    preview: 'Preview',
-    'check-failed': 'Check failed',
-  };
 
   const unresolved = [
     ...(result.mode === 'preview'
@@ -265,7 +258,7 @@ export function renderComparison(result: Comparison): string {
     renderIdentity(result.candidate, candidateLabel),
     '## Comparison availability',
     renderAvailability(result),
-    '## Absolute named checks',
+    '## Named checks',
     "Executed by Observed against each capture's evidence. Each result covers its stated expectation and scope; comparison availability is separate.",
     ...(result.mode === 'preview'
       ? []
