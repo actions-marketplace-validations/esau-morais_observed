@@ -1,7 +1,11 @@
 import { Effect } from 'effect';
 import path from 'node:path';
 import { expect, test } from 'vitest';
-import { describeFailure, summarize } from '../scripts/github-action';
+import {
+  describeFailure,
+  pageMatchesRun,
+  summarize,
+} from '../scripts/github-action';
 import { compareCaptures, inspectSide } from '../src/comparison';
 import { json } from '../src/encoding';
 
@@ -25,16 +29,19 @@ test('CI summaries never present unavailable or unreadable results as passing', 
     output: json({ directory: '/bundle', result }),
     exitCode: 1,
     artifact: 'observed-bundle',
+    page: null,
   });
   const mismatched = summarize({
     output: json({ directory: '/bundle', result }),
     exitCode: 0,
     artifact: 'observed-bundle',
+    page: null,
   });
   const unreadable = summarize({
     output: '{"result":{"conclusion":{"kind":"no-regression"}}}',
     exitCode: 0,
     artifact: 'observed-bundle',
+    page: null,
   });
 
   expect(unavailable.trusted).toBe(true);
@@ -81,4 +88,70 @@ test('a capture failure reason cannot break the job summary markup', () => {
   expect(line).toContain('Candidate capture failed (application)');
   expect(line).not.toMatch(/<img|[^\\]\||[^\\]\[/);
   expect(describeFailure('Base', { kind: 'complete' })).toEqual([]);
+});
+
+test('the summary links only an https report page and cannot be steered by its URL', async () => {
+  const missing = await Effect.runPromise(
+    inspectSide({ directory: null, prefix: 'candidate', evaluatedAt }),
+  );
+  const result = compareCaptures({
+    base: missing,
+    candidate: missing,
+    evaluatedAt,
+    visual: { kind: 'unavailable', reason: 'No captures' },
+  });
+  const summary = (page: string | null) =>
+    summarize({
+      output: json({ directory: '/bundle', result }),
+      exitCode: 1,
+      artifact: 'observed-bundle',
+      page,
+    }).markdown;
+  const page = 'https://github.com/o/r/actions/runs/1/artifacts/2';
+
+  expect(summary(page)).toContain(`[Open the report](${page})`);
+  expect(summary(page)).toContain('## Observed: Unavailable');
+
+  expect(
+    summarize({
+      output: json({ directory: '/bundle', result }),
+      exitCode: 0,
+      artifact: 'observed-bundle',
+      page,
+    }).markdown,
+  ).not.toContain('Open the report');
+
+  for (const url of [
+    null,
+    'javascript:alert(1)',
+    'https://x) ![img](https://y',
+  ]) {
+    expect(summary(url)).not.toContain('Open the report');
+    expect(summary(url)).toContain('No report page was uploaded');
+  }
+});
+
+test('a report page is written only when it shows the same result as the run', async () => {
+  const missing = await Effect.runPromise(
+    inspectSide({ directory: null, prefix: 'candidate', evaluatedAt }),
+  );
+  const result = compareCaptures({
+    base: missing,
+    candidate: missing,
+    evaluatedAt,
+    visual: { kind: 'unavailable', reason: 'No captures' },
+  });
+  const run = json({ directory: '/bundle', result });
+
+  expect(pageMatchesRun(json(result), run)).toBe(true);
+  expect(
+    pageMatchesRun(
+      json({
+        ...result,
+        conclusion: { kind: 'no-regression', text: 'No regression' },
+      }),
+      run,
+    ),
+  ).toBe(false);
+  expect(pageMatchesRun(json(result), null)).toBe(false);
 });
