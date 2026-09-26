@@ -9,10 +9,18 @@ import {
   type Comparison,
   type Side,
 } from '../src/comparison-model';
-import type { Capture } from '../src/capture/model';
+import type { Capture, Source } from '../src/capture/model';
 import { escapeText } from '../src/comparison-report';
 import { loadProject } from '../src/project';
 import { renderReportPage } from '../src/report-page';
+import {
+  checkConclusion,
+  checkName,
+  commentMarker,
+  DeliveryError,
+  postCheckRun,
+  upsertComment,
+} from './github-delivery';
 import { describeRevision, shortSource } from '../src/provenance-text';
 import { describeVisual } from '../src/visual-text';
 import {
@@ -48,14 +56,17 @@ const consequences = {
   preview: 'A preview compares no revisions. The job passes.',
 } satisfies Record<Kind, string>;
 
-// GitHub autolinks bare URLs even when their punctuation is escaped.
+// GitHub autolinks bare URLs even when their punctuation is escaped, and in a
+// comment captured @mentions and #references would notify people or issues.
 export function inlineText(value: string): string {
   return value
     .split(/(https?:\/\/[^\s`]+)/)
     .map((part, index) =>
       index % 2 === 1
         ? `\`${part.replace(/\.$/, '')}\`${part.endsWith('.') ? '.' : ''}`
-        : escapeText(part),
+        : escapeText(
+            part.replaceAll('@', '@\u200b').replaceAll('#', '#\u200b'),
+          ),
     )
     .join('');
 }
@@ -112,6 +123,13 @@ const httpsUrlSchema = Schema.String.check(
   Schema.isPattern(/^https:\/\/[^\s()<>[\]]+$/),
 );
 
+export type Summary = {
+  markdown: string;
+  trusted: boolean;
+  title: string;
+  kind: Kind | null;
+};
+
 function alert(kind: string, lines: string[]): string {
   return [
     `> [!${kind}]`,
@@ -137,7 +155,9 @@ export function summarize(options: {
   artifact: string;
   page: string | null;
   repository?: string | null;
-}): { markdown: string; trusted: boolean } {
+  delivery?: string | null;
+  headline?: boolean;
+}): Summary {
   const decoded =
     options.output === null
       ? Option.none()
@@ -153,12 +173,19 @@ export function summarize(options: {
   const untrusted = (reason: string) => ({
     markdown: [
       alert('WARNING', [
-        '**No result. Treat this run as unavailable, not passed.**',
+        ...(options.headline === false
+          ? []
+          : ['**No result. Treat this run as unavailable, not passed.**']),
         `${reason} The job fails. The job log has details.`,
       ]),
       bundle,
+      ...(options.delivery === undefined || options.delivery === null
+        ? []
+        : [options.delivery]),
     ].join('\n\n'),
     trusted: false,
+    title: 'No result: treat this run as unavailable',
+    kind: null,
   });
 
   if (Option.isNone(decoded)) {
@@ -212,7 +239,9 @@ export function summarize(options: {
 
   const markdown = [
     alert(alerts[conclusionTones[kind]], [
-      `**${inlineText(headline(result))}**`,
+      ...(options.headline === false
+        ? []
+        : [`**${inlineText(headline(result))}**`]),
       `${inlineText(result.conclusion.text.replace(/\.?$/, '.'))} ${consequences[kind]}`,
     ]),
     [
@@ -238,11 +267,75 @@ export function summarize(options: {
             'The report opens for signed-in users who can read this repository, until the artifact expires.',
             bundle,
           ]),
+      ...(options.delivery === undefined || options.delivery === null
+        ? []
+        : [options.delivery]),
       exit,
     ]),
   ].join('\n\n');
 
-  return { markdown, trusted: true };
+  return { markdown, trusted: true, title: headline(result), kind };
+}
+
+export function deliveryNote(options: {
+  note: string;
+  configured: boolean;
+  untrustedSource: boolean;
+  tokenOutcome: string;
+}): string | null {
+  if (options.note !== '') {
+    return options.note;
+  }
+
+  if (options.untrustedSource) {
+    return 'No GitHub check or pull request comment was posted: pull requests from forks and Dependabot receive no secrets.';
+  }
+
+  if (!options.configured) {
+    return null;
+  }
+
+  return options.tokenOutcome === 'failure'
+    ? 'No GitHub check or pull request comment was posted: the GitHub App token could not be created. The job log has details.'
+    : 'No GitHub check or pull request comment was posted: the GitHub App client ID or private key is missing.';
+}
+
+export function capturedRevision(
+  revision: Source['revision'] | null,
+  commits: readonly string[],
+): 'match' | 'unavailable' | 'other' {
+  if (revision === null) {
+    return 'unavailable';
+  }
+
+  return revision.kind === 'commit' && commits.includes(revision.commit)
+    ? 'match'
+    : 'other';
+}
+
+function link(label: string, url: string | null): string | null {
+  return url !== null && Schema.is(httpsUrlSchema)(url)
+    ? `[${label}](${url})`
+    : null;
+}
+
+async function writeOutput(name: string, value: string) {
+  const file = process.env.GITHUB_OUTPUT;
+
+  if (file !== undefined && file !== '') {
+    await appendFile(file, `${name}=${value.replace(/[\r\n]+/g, ' ')}\n`);
+  }
+}
+
+function environment(name: string): string {
+  return process.env[name] ?? '';
+}
+
+function repositoryUrl(): string | null {
+  const server = environment('GITHUB_SERVER_URL');
+  const repository = environment('GITHUB_REPOSITORY');
+
+  return server === '' || repository === '' ? null : `${server}/${repository}`;
 }
 
 async function writeSummary(markdown: string) {
@@ -319,6 +412,110 @@ if (import.meta.main) {
     }
 
     await writeFile(output, page, { flag: 'wx' });
+  } else if (command === 'deliver' && args.length === 4) {
+    const [resultFile = '', exitCode = '', artifact = '', page = ''] = args;
+    const output = await readOptional(resultFile);
+    const repository = repositoryUrl();
+    const summary = summarize({
+      output,
+      exitCode: Option.getOrNull(
+        Schema.decodeUnknownOption(exitCodeSchema)(exitCode),
+      ),
+      artifact,
+      page: page === '' ? null : page,
+      repository,
+    });
+    const headSha = environment('OBSERVED_HEAD_SHA');
+    const decoded =
+      output === null
+        ? Option.none()
+        : Schema.decodeUnknownOption(runOutputSchema)(output);
+    const identity = Option.isNone(decoded)
+      ? 'unavailable'
+      : capturedRevision(
+          decoded.value.result.candidate.capture?.manifest.source.revision ??
+            null,
+          [headSha, environment('GITHUB_SHA')],
+        );
+
+    if (identity === 'other') {
+      await writeOutput(
+        'note',
+        `No GitHub check or pull request comment was posted: the candidate capture is not pull request head ${headSha.slice(0, 7)} or its merge commit.`,
+      );
+      process.exit(0);
+    }
+
+    const pullRequest = Number(environment('OBSERVED_PULL_REQUEST'));
+    const target = {
+      api:
+        environment('GITHUB_API_URL') === ''
+          ? 'https://api.github.com'
+          : environment('GITHUB_API_URL'),
+      repository: environment('GITHUB_REPOSITORY'),
+      token: environment('OBSERVED_GITHUB_TOKEN'),
+      headSha,
+      pullRequest:
+        Number.isInteger(pullRequest) && pullRequest > 0 ? pullRequest : null,
+      detailsUrl: Schema.is(httpsUrlSchema)(page)
+        ? page
+        : `${repository ?? ''}/actions/runs/${environment('GITHUB_RUN_ID')}`,
+      botLogin: `${environment('OBSERVED_APP_SLUG')}[bot]`,
+    };
+    const attempt = async (
+      label: string,
+      post: () => Promise<string | null>,
+    ) => {
+      try {
+        const url = await post();
+
+        return url === null ? null : (link(label, url) ?? label);
+      } catch (error) {
+        const reason =
+          error instanceof DeliveryError
+            ? error.message
+            : 'an unexpected error';
+
+        process.stdout.write(
+          `::warning title=Observed::Posting the ${label} failed: ${reason}\n`,
+        );
+
+        return `the ${label} failed (${reason})`;
+      }
+    };
+
+    const name = checkName(artifact);
+    const check = await attempt('GitHub check', () =>
+      postCheckRun(target, {
+        name,
+        title: summary.title,
+        markdown: summarize({
+          output,
+          exitCode: Option.getOrNull(
+            Schema.decodeUnknownOption(exitCodeSchema)(exitCode),
+          ),
+          artifact,
+          page: page === '' ? null : page,
+          repository,
+          headline: false,
+        }).markdown,
+        conclusion: checkConclusion(summary.kind),
+      }),
+    );
+    const comment = await attempt('pull request comment', () =>
+      upsertComment(
+        target,
+        commentMarker(artifact),
+        name === 'Observed'
+          ? summary.markdown
+          : `<sub>${inlineText(name)}</sub>\n\n${summary.markdown}`,
+      ),
+    );
+
+    await writeOutput(
+      'note',
+      `GitHub delivery: ${[check, comment].filter((item) => item !== null).join('; ')}.`,
+    );
   } else if (command === 'summary' && args.length === 4) {
     const [resultFile = '', exitCode = '', artifact = '', page = ''] = args;
     const summary = summarize({
@@ -328,11 +525,13 @@ if (import.meta.main) {
       ),
       artifact,
       page: page === '' ? null : page,
-      repository:
-        process.env.GITHUB_SERVER_URL !== undefined &&
-        process.env.GITHUB_REPOSITORY !== undefined
-          ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}`
-          : null,
+      repository: repositoryUrl(),
+      delivery: deliveryNote({
+        note: environment('OBSERVED_DELIVERY_NOTE'),
+        configured: environment('OBSERVED_APP_CONFIGURED') === 'true',
+        untrustedSource: environment('OBSERVED_UNTRUSTED_SOURCE') === 'true',
+        tokenOutcome: environment('OBSERVED_APP_TOKEN_OUTCOME'),
+      }),
     });
 
     await writeSummary(summary.markdown);
@@ -342,7 +541,7 @@ if (import.meta.main) {
     }
   } else {
     process.stderr.write(
-      'Usage: github-action.ts preflight <project> | page <report-directory> <result.json> <output.html> | summary <result.json> <exit-code> <artifact-name> <page-url>\n',
+      'Usage: github-action.ts preflight <project> | page <report-directory> <result.json> <output.html> | summary|deliver <result.json> <exit-code> <artifact-name> <page-url>\n',
     );
     process.exit(64);
   }

@@ -277,6 +277,70 @@ a disposable account: the report page and bundle hold screenshots of every page
 the journey reaches. Literal fill values, such as a username, appear in both as
 written, so never write a password as a literal value.
 
+### Post results to the pull request
+
+With a GitHub App, the action also posts each result as an **Observed** check run
+and as a pull request comment. The check shows in the merge box, and its
+Details link opens the report page. The comment has the same verdict, revisions
+and report link, and later runs edit it instead of adding new ones. A workflow
+that calls the action more than once, such as a matrix, gets one check and one
+comment per `artifact-name`. The App needs
+no server or webhook: the job creates a short-lived token after capture finishes.
+
+1. Create a GitHub App under your account or organization's Developer settings.
+   Give it **Checks: Read and write** and **Pull requests: Read and write**.
+   Leave the webhook inactive and subscribe to no events.
+2. Install it on the repositories that run Observed, and only those.
+3. Generate a private key. Store it as the repository secret
+   `OBSERVED_APP_PRIVATE_KEY` and the App's Client ID as the repository variable
+   `OBSERVED_APP_CLIENT_ID`, then delete the downloaded key file.
+4. Pass both to the action and grant nothing extra to the workflow token. The
+   `concurrency` block cancels an older run, so it can't overwrite the comment
+   with a stale result:
+
+```yaml
+concurrency:
+  group: observed-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  observe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: esau-morais/observed@OBSERVED_COMMIT_SHA
+        with:
+          project: .
+          base: ${{ github.event.pull_request.base.sha }}
+          github-app-client-id: ${{ vars.OBSERVED_APP_CLIENT_ID }}
+          github-app-private-key: ${{ secrets.OBSERVED_APP_PRIVATE_KEY }}
+```
+
+The action posts only when the captured candidate is the pull request's head
+commit or the merge commit GitHub checks out for it. To run Observed again, re-run the
+workflow. The **Re-run** button on the Observed check itself does nothing,
+because the App has no server to receive it.
+
+| Result | Check conclusion |
+| --- | --- |
+| Regression, check failed, unavailable, or no readable result | Failure |
+| No regression | Success |
+| Not checked or preview | Neutral |
+
+GitHub treats a neutral check as passing when you make it required, so a project
+without a named check can merge on a neutral Observed check. Add a check to
+`observed.json` before you require it.
+
+Pull requests from forks and Dependabot receive no secrets, so the App posts
+nothing for them. The job summary still shows the result and says why nothing
+was posted, and the job passes or fails on Observed's result as before. A
+required Observed check stays missing on those pull requests until a maintainer
+runs the workflow with credentials.
+
 This repository runs the same action on the Request lab example in
 [.github/workflows/observe.yml](.github/workflows/observe.yml).
 
