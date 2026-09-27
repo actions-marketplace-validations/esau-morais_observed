@@ -19,19 +19,25 @@ import {
 } from '../src/capture/model';
 import { json, sha256 } from '../src/encoding';
 import type { Recipe } from '../src/capture/recipe';
+import type { EvidenceValue } from '../src/evidence-kinds';
 import {
   fixtureHash,
   observed,
   producer,
   recipe,
 } from './support/request-recipe';
+import { defineCheck, perSide, type CheckInput } from '../src/checks/define';
 import {
-  compareCaptures,
-  inspectComparison,
+  compareJourney,
+  evaluateCheck,
+  inspectJourney,
   inspectSide,
+  summarizeJourneys,
 } from '../src/comparison';
 import {
   comparisonSchema,
+  journeySchema,
+  type Journey,
   type Selection,
   type Visual,
 } from '../src/comparison-model';
@@ -47,10 +53,18 @@ const pixelsNotInspected: Visual = {
   reason: 'Synthetic sides without screenshot pixels',
 };
 const directories: string[] = [];
+const [requestCheck] = recipe.checks;
+
+function single(
+  journey: Journey,
+  mode: 'preview' | 'comparison' = 'comparison',
+) {
+  return summarizeJourneys({ journeys: [journey], evaluatedAt, mode });
+}
 
 function syntheticObservations(count = 1): Observations {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     requests: Array.from({ length: count }, () => ({
       method: 'GET',
       origin: 'application',
@@ -79,6 +93,7 @@ async function syntheticBundle(
     image?: string | Uint8Array;
     observations?: Observations;
     contract?: Recipe;
+    text?: EvidenceValue<'text'>;
   } = {},
 ) {
   const directory = await mkdtemp(
@@ -128,6 +143,15 @@ async function syntheticBundle(
       path: 'observations.json',
       text: json(options.observations ?? syntheticObservations(options.count)),
     },
+    ...(options.text === undefined
+      ? []
+      : [
+          {
+            id: 'evidence-text',
+            path: 'evidence/text.json',
+            text: json({ kind: 'text', schemaVersion: 1, value: options.text }),
+          },
+        ]),
     ...files.map((file, index) => ({
       id: `arbitrary-source-id-${index}`,
       path: `source/${file.path}`,
@@ -151,7 +175,7 @@ async function syntheticBundle(
   }
 
   const capture: Capture = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     kind: 'capture',
     id: path.basename(directory),
     label: 'Synthetic unit fixture',
@@ -186,6 +210,21 @@ async function syntheticBundle(
     finishedAt: '2026-09-23T11:59:59.000Z',
     execution: { kind: 'complete' },
     artifacts,
+    evidence: artifacts.flatMap((artifact) =>
+      artifact.id === 'evidence-text'
+        ? [
+            {
+              kind: 'text',
+              schemaVersion: 1,
+              status: 'recorded' as const,
+              path: artifact.path,
+              sha256: artifact.sha256,
+              producer,
+              conditions: {},
+            },
+          ]
+        : [],
+    ),
   };
 
   await saveManifest(directory, capture);
@@ -256,8 +295,12 @@ test('the viewer serves the result evaluated at export instead of re-grading cap
 
   const exported = await Effect.runPromise(
     exportComparison({
-      baseDirectory: base.directory,
-      candidateDirectory: candidate.directory,
+      journeys: [
+        {
+          baseDirectory: base.directory,
+          candidateDirectory: candidate.directory,
+        },
+      ],
       directory: path.join(root, 'report'),
       viewerDirectory: path.join(root, 'dist/viewer'),
     }).pipe(
@@ -293,17 +336,17 @@ test('derives a regression from verified request observations despite unchanged 
   const base = await syntheticBundle();
   const candidate = await syntheticBundle({ count: 4 });
 
-  const { result } = await Effect.runPromise(
-    inspectComparison({
+  const { journey: result } = await Effect.runPromise(
+    inspectJourney({
       baseDirectory: base.directory,
       candidateDirectory: candidate.directory,
       evaluatedAt,
     }),
   );
 
-  expect(result.base.check).toMatchObject({ outcome: 'passed', actual: 1 });
+  expect(result.base.checks[0]).toMatchObject({ outcome: 'passed', actual: 1 });
 
-  expect(result.candidate.check).toMatchObject({
+  expect(result.candidate.checks[0]).toMatchObject({
     outcome: 'failed',
     actual: 4,
   });
@@ -328,18 +371,18 @@ test('derives a regression from verified request observations despite unchanged 
   });
 
   expect(
-    Schema.decodeUnknownSync(comparisonSchema)(JSON.parse(json(result))),
+    Schema.decodeUnknownSync(journeySchema)(JSON.parse(json(result))),
   ).toEqual(result);
 });
 
 test('rejects saved results whose side state contradicts its evidence', async () => {
-  const result = compareCaptures({
+  const result = compareJourney({
     visual: pixelsNotInspected,
     base: await inspect((await syntheticBundle()).directory),
     candidate: await inspect((await syntheticBundle()).directory),
     evaluatedAt,
   });
-  const decode = Schema.decodeUnknownExit(comparisonSchema);
+  const decode = Schema.decodeUnknownExit(journeySchema);
 
   expect(decode(result)._tag).toBe('Success');
 
@@ -380,8 +423,12 @@ test('exports changed pixels as a located observation with a served difference i
 
   const exported = await Effect.runPromise(
     exportComparison({
-      baseDirectory: base.directory,
-      candidateDirectory: candidate.directory,
+      journeys: [
+        {
+          baseDirectory: base.directory,
+          candidateDirectory: candidate.directory,
+        },
+      ],
       directory: path.join(root, 'report'),
       viewerDirectory: path.join(root, 'viewer'),
     }).pipe(
@@ -391,7 +438,7 @@ test('exports changed pixels as a located observation with a served difference i
   );
 
   expect(exported.result.conclusion.kind).toBe('no-regression');
-  expect(exported.result.comparison).toMatchObject({
+  expect(exported.result.journeys[0].comparison).toMatchObject({
     kind: 'available',
     requestDifference: 0,
     visual: {
@@ -400,23 +447,23 @@ test('exports changed pixels as a located observation with a served difference i
       changedPixels: 1,
       regionCount: 1,
       regions: [{ x: 1, y: 2, width: 1, height: 1, changedPixels: 1 }],
-      diff: { path: 'visual-diff.png' },
+      diff: { path: 'journey-1/visual-diff.png' },
     },
   });
 
   if (
-    exported.result.comparison.kind !== 'available' ||
-    exported.result.comparison.visual.kind !== 'changed'
+    exported.result.journeys[0].comparison.kind !== 'available' ||
+    exported.result.journeys[0].comparison.visual.kind !== 'changed'
   ) {
     throw new Error('Expected a changed pixel observation');
   }
 
-  const diff = exported.result.comparison.visual.diff;
+  const diff = exported.result.journeys[0].comparison.visual.diff;
   const saved = await readFile(path.join(exported.directory, diff.path));
   expect(sha256(saved)).toBe(diff.sha256);
   expect(
     await readFile(path.join(exported.directory, 'report.md'), 'utf8'),
-  ).toContain('(<visual-diff.png>)');
+  ).toContain('(<journey-1/visual-diff.png>)');
 
   const served = await Effect.runPromise(
     Effect.gen(function* () {
@@ -461,8 +508,8 @@ test('writes no difference image when changed screenshots belong to captures tha
     image: encodeRgbPng(4, 4, changed),
   });
 
-  const { result, visualDiff } = await Effect.runPromise(
-    inspectComparison({
+  const { journey: result, visualDiff } = await Effect.runPromise(
+    inspectJourney({
       baseDirectory: base.directory,
       candidateDirectory: candidate.directory,
       evaluatedAt,
@@ -480,8 +527,8 @@ test('identical but undecodable screenshots leave the pixel observation unavaila
   const base = await syntheticBundle({ image: 'synthetic image bytes' });
   const candidate = await syntheticBundle({ image: 'synthetic image bytes' });
 
-  const { result, visualDiff } = await Effect.runPromise(
-    inspectComparison({
+  const { journey: result, visualDiff } = await Effect.runPromise(
+    inspectJourney({
       baseDirectory: base.directory,
       candidateDirectory: candidate.directory,
       evaluatedAt,
@@ -503,12 +550,14 @@ test('evaluates a project-defined POST expectation without an items recipe in th
   const contract = {
     ...recipe,
     id: 'checkout-submit',
-    check: {
-      ...recipe.check,
-      method: 'POST',
-      path: '/orders',
-      expectedCount: 2,
-    },
+    checks: [
+      {
+        ...requestCheck,
+        method: 'POST',
+        path: '/orders',
+        expectedCount: 2,
+      },
+    ],
   };
   const contractText = json(contract);
   const bundle = await syntheticBundle({
@@ -533,7 +582,7 @@ test('evaluates a project-defined POST expectation without an items recipe in th
     ),
   });
 
-  expect((await inspect(bundle.directory)).check).toMatchObject({
+  expect((await inspect(bundle.directory)).checks[0]).toMatchObject({
     outcome: 'passed',
     actual: 2,
   });
@@ -545,14 +594,14 @@ test.each([0, 2])(
     const base = await syntheticBundle({ count: 3 });
     const candidate = await syntheticBundle({ count });
 
-    const result = compareCaptures({
+    const result = compareJourney({
       visual: pixelsNotInspected,
       base: await inspect(base.directory),
       candidate: await inspect(candidate.directory),
       evaluatedAt,
     });
 
-    expect(result.candidate.check).toMatchObject({
+    expect(result.candidate.checks[0]).toMatchObject({
       outcome: 'failed',
       actual: count,
     });
@@ -604,12 +653,12 @@ test('counts only matching GET requests and requires their status to be 200', as
     },
   });
 
-  expect((await inspect(passing.directory)).check).toMatchObject({
+  expect((await inspect(passing.directory)).checks[0]).toMatchObject({
     outcome: 'passed',
     actual: 1,
   });
 
-  expect((await inspect(failed.directory)).check).toMatchObject({
+  expect((await inspect(failed.directory)).checks[0]).toMatchObject({
     outcome: 'failed',
     actual: 1,
   });
@@ -626,30 +675,28 @@ test('matches a protected request origin without conflating the same path on ano
       status: 202,
     })),
   ];
-  if (recipe.check?.kind !== 'request-count') {
-    throw new Error('Request recipe expected');
-  }
-
   for (const definition of [
-    recipe.check,
-    { ...recipe.check, origin, status: 202 },
+    requestCheck,
+    { ...requestCheck, origin, status: 202 },
   ]) {
     const bundle = await syntheticBundle({
-      contract: { ...recipe, allowedOrigins: [origin], check: definition },
+      contract: { ...recipe, allowedOrigins: [origin], checks: [definition] },
       observations: { ...observations, requests },
     });
     const side = await inspect(bundle.directory);
-    expect(side.check).toMatchObject({
+    expect(side.checks[0]).toMatchObject({
       outcome: 'passed',
       actual: 1,
     });
     const report = renderComparison(
-      compareCaptures({
-        visual: pixelsNotInspected,
-        base: side,
-        candidate: side,
-        evaluatedAt,
-      }),
+      single(
+        compareJourney({
+          visual: pixelsNotInspected,
+          base: side,
+          candidate: side,
+          evaluatedAt,
+        }),
+      ),
     );
     expect(report).toContain('| GET | /api/items | 200 |');
     expect(report).toContain(
@@ -660,9 +707,9 @@ test('matches a protected request origin without conflating the same path on ano
   const unconfigured = await syntheticBundle({
     observations: { ...observations, requests },
   });
-  const check = (await inspect(unconfigured.directory)).check;
-  expect(check.outcome).toBe('unknown');
-  expect(check.detail).toContain('outside the protected recipe');
+  const [check] = (await inspect(unconfigured.directory)).checks;
+  expect(check?.outcome).toBe('unknown');
+  expect(check?.detail).toContain('outside the protected recipe');
 });
 
 test('keeps browser errors as unresolved evidence without inventing another check', async () => {
@@ -675,7 +722,7 @@ test('keeps browser errors as unresolved evidence without inventing another chec
 
   const side = await inspect(bundle.directory);
 
-  expect(side.check.outcome).toBe('passed');
+  expect(side.checks[0]?.outcome).toBe('passed');
 
   expect(side.unresolved).toContain('Browser error: Synthetic page error');
 });
@@ -687,15 +734,15 @@ test('serializes empty and newline-terminated browser errors without losing thei
     observations: { ...syntheticObservations(), browserErrors },
   });
 
-  const { result } = await Effect.runPromise(
-    inspectComparison({
+  const { journey: result } = await Effect.runPromise(
+    inspectJourney({
       baseDirectory: null,
       candidateDirectory: bundle.directory,
       evaluatedAt,
     }),
   );
 
-  expect(result.candidate.check.outcome).toBe('passed');
+  expect(result.candidate.checks[0]?.outcome).toBe('passed');
 
   expect(result.candidate).toMatchObject({
     execution: 'complete',
@@ -704,14 +751,14 @@ test('serializes empty and newline-terminated browser errors without losing thei
 
   const decoded = Schema.decodeUnknownSync(
     Schema.fromJsonString(comparisonSchema),
-  )(json(result));
+  )(json(single(result)));
 
-  expect(decoded.candidate).toMatchObject({
+  expect(decoded.journeys[0].candidate).toMatchObject({
     execution: 'complete',
     observations: { browserErrors },
   });
 
-  expect(decoded.candidate.unresolved).toHaveLength(2);
+  expect(decoded.journeys[0].candidate.unresolved).toHaveLength(2);
 });
 
 test.each([
@@ -722,17 +769,17 @@ test.each([
   async (count, outcome, conclusion) => {
     const candidate = await syntheticBundle({ count });
 
-    const { result } = await Effect.runPromise(
-      inspectComparison({
+    const { journey: result } = await Effect.runPromise(
+      inspectJourney({
         baseDirectory: null,
         candidateDirectory: candidate.directory,
         evaluatedAt,
       }),
     );
 
-    expect(result.candidate.check.outcome).toBe(outcome);
+    expect(result.candidate.checks[0]?.outcome).toBe(outcome);
 
-    expect(result.base.check.outcome).toBe('unknown');
+    expect(result.base.checks[0]?.outcome).toBe('unknown');
 
     expect(result.comparison.kind).toBe('unavailable');
 
@@ -744,11 +791,11 @@ test.each([
 
 test('previews without a baseline or a named check, while a requested missing baseline remains unavailable', async () => {
   const bundle = await syntheticBundle({
-    contract: { ...recipe, check: null },
+    contract: { ...recipe, checks: [] },
   });
   const base = await inspect(null);
   const candidate = await inspect(bundle.directory);
-  const preview = compareCaptures({
+  const preview = compareJourney({
     visual: pixelsNotInspected,
     base,
     candidate,
@@ -757,10 +804,11 @@ test('previews without a baseline or a named check, while a requested missing ba
   });
 
   expect(preview.comparison.kind).toBe('preview');
-  expect(preview.candidate.check.outcome).toBe('not-run');
+  expect(preview.candidate.checks).toEqual([]);
+  expect(preview.checks).toEqual([]);
   expect(preview.conclusion.kind).toBe('preview');
   expect(
-    compareCaptures({
+    compareJourney({
       visual: pixelsNotInspected,
       base,
       candidate,
@@ -772,7 +820,7 @@ test('previews without a baseline or a named check, while a requested missing ba
     path.join(bundle.directory, 'images/after #1.png'),
     'corrupt',
   );
-  const failed = compareCaptures({
+  const failed = compareJourney({
     visual: pixelsNotInspected,
     base,
     candidate: await inspect(bundle.directory),
@@ -798,30 +846,34 @@ test.each([
     expected: 'failed',
   },
   { observed: undefined, expected: 'unknown' },
+  {
+    observed: { selector: '#other', count: 1, value: 'Saved' },
+    expected: 'unknown',
+  },
 ] as const)(
   'evaluates text expectations with outcome $expected',
   async ({ observed, expected }) => {
     const bundle = await syntheticBundle({
       contract: {
         ...recipe,
-        check: {
-          kind: 'text',
-          id: 'saved',
-          name: 'Saved status',
-          scope: 'After saving',
-          selector: '#status',
-          expectedText: 'Saved',
-        },
+        checks: [
+          {
+            kind: 'text',
+            id: 'saved',
+            name: 'Saved status',
+            scope: 'After saving',
+            selector: '#status',
+            expectedText: 'Saved',
+          },
+        ],
+        collectors: [{ kind: 'text', selectors: ['#status'] }],
       },
-      observations: {
-        ...syntheticObservations(),
-        ...(observed === undefined ? {} : { text: observed }),
-      },
+      ...(observed === undefined ? {} : { text: { elements: [observed] } }),
     });
     const candidate = await inspect(bundle.directory);
 
-    expect(candidate.check.outcome).toBe(expected);
-    const preview = compareCaptures({
+    expect(candidate.checks[0]?.outcome).toBe(expected);
+    const preview = compareJourney({
       visual: pixelsNotInspected,
       base: await inspect(null),
       candidate,
@@ -833,7 +885,7 @@ test.each([
         expected
       ],
     );
-    const compared = compareCaptures({
+    const compared = compareJourney({
       visual: pixelsNotInspected,
       base: candidate,
       candidate,
@@ -855,28 +907,31 @@ test('renders captured text literally instead of injecting Markdown headings or 
   const bundle = await syntheticBundle({
     contract: {
       ...recipe,
-      check: {
-        kind: 'text',
-        id: 'status',
-        name: 'Status',
-        scope: 'After capture',
-        selector: '#status',
-        expectedText: 'Saved',
-      },
+      checks: [
+        {
+          kind: 'text',
+          id: 'status',
+          name: 'Status',
+          scope: 'After capture',
+          selector: '#status',
+          expectedText: 'Saved',
+        },
+      ],
+      collectors: [{ kind: 'text', selectors: ['#status'] }],
     },
-    observations: {
-      ...syntheticObservations(),
-      text: { selector: '#status', count: 1, value },
-    },
+    text: { elements: [{ selector: '#status', count: 1, value }] },
   });
   const report = renderComparison(
-    compareCaptures({
-      visual: pixelsNotInspected,
-      base: await inspect(null),
-      candidate: await inspect(bundle.directory),
-      evaluatedAt,
-      mode: 'preview',
-    }),
+    single(
+      compareJourney({
+        visual: pixelsNotInspected,
+        base: await inspect(null),
+        candidate: await inspect(bundle.directory),
+        evaluatedAt,
+        mode: 'preview',
+      }),
+      'preview',
+    ),
   );
 
   expect(report).not.toContain('\n\n## Forged heading');
@@ -912,14 +967,14 @@ test.each(['application', 'conditions', 'producer', 'observed'] as const)(
       ...incompatible[field],
     });
 
-    const result = compareCaptures({
+    const result = compareJourney({
       visual: pixelsNotInspected,
       base: await inspect(base.directory),
       candidate: await inspect(candidate.directory),
       evaluatedAt,
     });
 
-    expect(result.candidate.check.outcome).toBe('passed');
+    expect(result.candidate.checks[0]?.outcome).toBe('passed');
 
     expect(result.comparison.kind).toBe('unavailable');
 
@@ -989,7 +1044,7 @@ test.each([
       });
     }
 
-    const result = compareCaptures({
+    const result = compareJourney({
       visual: pixelsNotInspected,
       base: await inspect(base.directory),
       candidate: await inspect(candidate.directory),
@@ -1013,7 +1068,7 @@ test('adds no Observed source limitation when both captures name the same clean 
   const base = await syntheticBundle();
   const candidate = await syntheticBundle();
 
-  const result = compareCaptures({
+  const result = compareJourney({
     visual: pixelsNotInspected,
     base: await inspect(base.directory),
     candidate: await inspect(candidate.directory),
@@ -1038,7 +1093,7 @@ test('marks a schema version 3 capture unavailable with the reason instead of re
   const side = await inspect(base.directory);
 
   expect(side.execution).toBe('unavailable');
-  expect(side.check.detail).toContain(
+  expect(side.checks[0]?.detail).toContain(
     'Capture manifest schema version 3 is unsupported',
   );
 
@@ -1049,8 +1104,12 @@ test('marks a schema version 3 capture unavailable with the reason instead of re
 
   const exported = await Effect.runPromise(
     exportComparison({
-      baseDirectory: base.directory,
-      candidateDirectory: candidate.directory,
+      journeys: [
+        {
+          baseDirectory: base.directory,
+          candidateDirectory: candidate.directory,
+        },
+      ],
       directory: path.join(root, 'report'),
       viewerDirectory: path.join(root, 'viewer'),
     }).pipe(
@@ -1059,25 +1118,29 @@ test('marks a schema version 3 capture unavailable with the reason instead of re
     ),
   );
 
-  expect(exported.result.comparison).toMatchObject({ kind: 'unavailable' });
-  expect(json(exported.result.comparison)).toContain(
+  expect(exported.result.journeys[0].comparison).toMatchObject({
+    kind: 'unavailable',
+  });
+  expect(json(exported.result.journeys[0].comparison)).toContain(
     'Baseline unavailable: Capture manifest schema version 3 is unsupported',
   );
-  expect(exported.result.candidate.check.outcome).toBe('passed');
+  expect(exported.result.journeys[0].candidate.checks[0]?.outcome).toBe(
+    'passed',
+  );
 });
 
 test('tells the reader to update Observed for a newer capture schema instead of recapturing', async () => {
   const bundle = await syntheticBundle();
 
-  await saveManifest(bundle.directory, { ...bundle.capture, schemaVersion: 5 });
+  await saveManifest(bundle.directory, { ...bundle.capture, schemaVersion: 6 });
 
   const side = await inspect(bundle.directory);
 
   expect(side.execution).toBe('unavailable');
-  expect(side.check.detail).toContain(
-    'Capture manifest schema version 5 is unsupported. It was written by a newer Observed',
+  expect(side.checks[0]?.detail).toContain(
+    'Capture manifest schema version 6 is unsupported. It was written by a newer Observed',
   );
-  expect(side.check.detail).toContain('Update Observed.');
+  expect(side.checks[0]?.detail).toContain('Update Observed.');
 });
 
 test.each([
@@ -1100,11 +1163,11 @@ test.each([
 
   const side = await inspect(bundle.directory);
 
-  expect(side.check.outcome).toBe('unknown');
+  expect(side.checks[0]?.outcome).toBe('unknown');
 
   expect(side.execution).toBe('unavailable');
 
-  expect(side.check.detail).toContain('missing');
+  expect(side.checks[0]?.detail).toContain('missing');
 });
 
 test('checks all supplied artifacts rather than only those used by the named check', async () => {
@@ -1117,7 +1180,7 @@ test('checks all supplied artifacts rather than only those used by the named che
 
   const side = await inspect(bundle.directory);
 
-  expect(side.check.outcome).toBe('unknown');
+  expect(side.checks[0]?.outcome).toBe('unknown');
 
   const requests = side.artifacts.find(
     (artifact) => artifact.id === 'requests',
@@ -1126,7 +1189,7 @@ test('checks all supplied artifacts rather than only those used by the named che
   expect(requests?.integrity).toBe('unavailable');
   expect(requests).not.toHaveProperty('path');
 
-  expect(side.check.detail).toContain('SHA-256 mismatch');
+  expect(side.checks[0]?.detail).toContain('SHA-256 mismatch');
 });
 
 test('requires protected recipe bytes even when the artifact digest was updated', async () => {
@@ -1135,14 +1198,14 @@ test('requires protected recipe bytes even when the artifact digest was updated'
   await replaceArtifact(
     bundle,
     'recipe',
-    json({ ...recipe, check: { ...recipe.check, expectedCount: 4 } }),
+    json({ ...recipe, checks: [{ ...requestCheck, expectedCount: 4 }] }),
   );
 
   const side = await inspect(bundle.directory);
 
-  expect(side.check.outcome).toBe('unknown');
+  expect(side.checks[0]?.outcome).toBe('unknown');
 
-  expect(side.check.detail).toContain('protected recipe');
+  expect(side.checks[0]?.detail).toContain('protected recipe');
 });
 
 test.each(['source digest', 'source file digest', 'entry absent'] as const)(
@@ -1182,9 +1245,9 @@ test.each(['source digest', 'source file digest', 'entry absent'] as const)(
 
     const side = await inspect(bundle.directory);
 
-    expect(side.check.outcome).toBe('unknown');
+    expect(side.checks[0]?.outcome).toBe('unknown');
 
-    expect(side.check.detail).toContain('Source');
+    expect(side.checks[0]?.detail).toContain('Source');
   },
 );
 
@@ -1199,7 +1262,7 @@ test('hashes source identity in sorted path order regardless of manifest file or
     },
   });
 
-  expect((await inspect(bundle.directory)).check.outcome).toBe('passed');
+  expect((await inspect(bundle.directory)).checks[0]?.outcome).toBe('passed');
 });
 
 test.each(['manifestHash', 'sourceHash'] as const)(
@@ -1207,9 +1270,8 @@ test.each(['manifestHash', 'sourceHash'] as const)(
   async (field) => {
     const bundle = await syntheticBundle();
 
-    const selection: Selection = {
-      schemaVersion: 1,
-      evaluatedAt,
+    const selection: Selection['journeys'][number] = {
+      directory: 'journey-1',
       base: null,
       candidate: {
         manifestHash: sha256(
@@ -1220,8 +1282,8 @@ test.each(['manifestHash', 'sourceHash'] as const)(
       },
     };
 
-    const { result } = await Effect.runPromise(
-      inspectComparison({
+    const { journey: result } = await Effect.runPromise(
+      inspectJourney({
         baseDirectory: null,
         candidateDirectory: bundle.directory,
         evaluatedAt,
@@ -1229,7 +1291,7 @@ test.each(['manifestHash', 'sourceHash'] as const)(
       }),
     );
 
-    expect(result.candidate.check.outcome).toBe('unknown');
+    expect(result.candidate.checks[0]?.outcome).toBe('unknown');
 
     expect(result.candidate.execution).toBe('unavailable');
 
@@ -1271,7 +1333,7 @@ test.each(['failed', 'conditions', 'recipe'] as const)(
 
     const side = await inspect(bundle.directory);
 
-    expect(side.check.outcome).toBe('unknown');
+    expect(side.checks[0]?.outcome).toBe('unknown');
 
     expect(side.execution).toBe(
       problem === 'failed' ? 'capture-failed' : 'unavailable',
@@ -1288,16 +1350,17 @@ test('accepts the maximum age boundary and rejects stale or future captures', as
 
   const staleTime = new Date(Date.parse(lastValidTime) + 1).toISOString();
 
-  expect((await inspect(bundle.directory, lastValidTime)).check.outcome).toBe(
-    'passed',
-  );
-
-  expect((await inspect(bundle.directory, staleTime)).check.detail).toContain(
-    'stale',
-  );
+  expect(
+    (await inspect(bundle.directory, lastValidTime)).checks[0]?.outcome,
+  ).toBe('passed');
 
   expect(
-    (await inspect(bundle.directory, bundle.capture.startedAt)).check.detail,
+    (await inspect(bundle.directory, staleTime)).checks[0]?.detail,
+  ).toContain('stale');
+
+  expect(
+    (await inspect(bundle.directory, bundle.capture.startedAt)).checks[0]
+      ?.detail,
   ).toContain('future');
 });
 
@@ -1311,16 +1374,16 @@ test('keeps the current candidate check when the baseline is stale', async () =>
     finishedAt: '2026-09-21T11:59:59.000Z',
   });
 
-  const result = compareCaptures({
+  const result = compareJourney({
     visual: pixelsNotInspected,
     base: await inspect(base.directory),
     candidate: await inspect(candidate.directory),
     evaluatedAt,
   });
 
-  expect(result.base.check.detail).toContain('stale');
+  expect(result.base.checks[0]?.detail).toContain('stale');
 
-  expect(result.candidate.check.outcome).toBe('passed');
+  expect(result.candidate.checks[0]?.outcome).toBe('passed');
 
   expect(result.comparison.kind).toBe('unavailable');
 });
@@ -1333,14 +1396,14 @@ test('rechecks age during pure comparison without mutating the inspected inputs'
     Date.parse(bundle.capture.finishedAt) + recipe.maxAgeMs + 1,
   ).toISOString();
 
-  const first = compareCaptures({
+  const first = compareJourney({
     visual: pixelsNotInspected,
     base: side,
     candidate: side,
     evaluatedAt: staleAt,
   });
 
-  const second = compareCaptures({
+  const second = compareJourney({
     visual: pixelsNotInspected,
     base: side,
     candidate: side,
@@ -1351,11 +1414,11 @@ test('rechecks age during pure comparison without mutating the inspected inputs'
 
   expect(first.comparison.kind).toBe('unavailable');
 
-  expect(first.candidate.check.outcome).toBe('unknown');
+  expect(first.candidate.checks[0]?.outcome).toBe('unknown');
 
-  expect(first.candidate.check.detail).toContain('stale');
+  expect(first.candidate.checks[0]?.detail).toContain('stale');
 
-  expect(side.check.outcome).toBe('passed');
+  expect(side.checks[0]?.outcome).toBe('passed');
 });
 
 test.each([
@@ -1395,7 +1458,7 @@ test.each([
 
     const side = await inspect(bundle.directory);
 
-    expect(side.check.outcome).toBe('unknown');
+    expect(side.checks[0]?.outcome).toBe('unknown');
 
     expect(side).not.toHaveProperty('observations');
   },
@@ -1420,7 +1483,7 @@ test.each([
 
   const side = await inspect(bundle.directory);
 
-  expect(side.check.outcome).toBe('unknown');
+  expect(side.checks[0]?.outcome).toBe('unknown');
 
   expect(side.screenshot).toBeNull();
 
@@ -1446,9 +1509,9 @@ test('rejects symlink artifacts even when their target has the expected bytes', 
 
   const side = await inspect(bundle.directory);
 
-  expect(side.check.outcome).toBe('unknown');
+  expect(side.checks[0]?.outcome).toBe('unknown');
 
-  expect(side.check.detail).toContain('Symlink');
+  expect(side.checks[0]?.detail).toContain('Symlink');
 
   expect(side.screenshot).toBeNull();
 });
@@ -1458,20 +1521,362 @@ test('rejects missing files, malformed manifests, and absent conditions instead 
 
   await rm(path.join(bundle.directory, 'errors.json'));
 
-  expect((await inspect(bundle.directory)).check.detail).toContain('ENOENT');
+  expect((await inspect(bundle.directory)).checks[0]?.detail).toContain(
+    'ENOENT',
+  );
 
   await writeFile(path.join(bundle.directory, 'capture.json'), '{');
 
-  expect((await inspect(bundle.directory)).check.detail).toContain('malformed');
+  expect((await inspect(bundle.directory)).checks[0]?.detail).toContain(
+    'malformed',
+  );
 
   await saveManifest(bundle.directory, {
     ...bundle.capture,
     conditions: undefined,
   });
 
-  expect((await inspect(bundle.directory)).check.outcome).toBe('unknown');
+  expect((await inspect(bundle.directory)).checks[0]?.outcome).toBe('unknown');
 
   await rm(path.join(bundle.directory, 'capture.json'));
 
-  expect((await inspect(bundle.directory)).check.detail).toContain('ENOENT');
+  expect((await inspect(bundle.directory)).checks[0]?.detail).toContain(
+    'ENOENT',
+  );
+});
+
+const savedText = {
+  kind: 'text',
+  id: 'saved',
+  name: 'Saved status',
+  scope: 'After saving',
+  selector: '#status',
+  expectedText: 'Saved',
+} as const;
+
+const twoChecks: Recipe = {
+  ...recipe,
+  checks: [requestCheck, savedText],
+  collectors: [{ kind: 'text', selectors: ['#status'] }],
+};
+
+function statusText(value: string | null, count = 1) {
+  return { elements: [{ selector: '#status', count, value }] };
+}
+
+test.each([
+  {
+    name: 'a regression in one check wins over a passing one',
+    base: { count: 1, text: statusText('Saved') },
+    candidate: { count: 4, text: statusText('Saved') },
+    conclusion: 'regression',
+    verdicts: ['regression', 'passed'],
+    passed: 1,
+  },
+  {
+    name: 'a failed check wins over an unknown one',
+    base: { count: 4, text: statusText('Saved') },
+    candidate: { count: 4, text: undefined },
+    conclusion: 'check-failed',
+    verdicts: ['failed', 'unknown'],
+    passed: 0,
+  },
+  {
+    name: 'an unknown check makes a passing journey unavailable',
+    base: { count: 1, text: statusText('Saved') },
+    candidate: { count: 1, text: undefined },
+    conclusion: 'unavailable',
+    verdicts: ['passed', 'unknown'],
+    passed: 1,
+  },
+  {
+    name: 'all checks passing is no regression',
+    base: { count: 1, text: statusText('Pending') },
+    candidate: { count: 1, text: statusText('Saved') },
+    conclusion: 'no-regression',
+    verdicts: ['passed', 'passed'],
+    passed: 2,
+  },
+] as const)(
+  'aggregates several checks in one journey: $name',
+  async ({ base, candidate, conclusion, verdicts, passed }) => {
+    const sides = await Promise.all(
+      [base, candidate].map(async ({ count, text }) =>
+        inspect(
+          (
+            await syntheticBundle({
+              count,
+              contract: twoChecks,
+              ...(text === undefined ? {} : { text }),
+            })
+          ).directory,
+        ),
+      ),
+    );
+    const [before, after] = sides;
+
+    if (before === undefined || after === undefined) {
+      throw new Error('Two sides expected');
+    }
+
+    const result = single(
+      compareJourney({
+        visual: pixelsNotInspected,
+        base: before,
+        candidate: after,
+        evaluatedAt,
+      }),
+    );
+    const [journey] = result.journeys;
+
+    expect(result.conclusion.kind).toBe(conclusion);
+    expect(journey.checks.map((check) => check.verdict)).toEqual(verdicts);
+    expect(journey.checks.map((check) => check.scope)).toEqual([
+      requestCheck.scope,
+      savedText.scope,
+    ]);
+    expect(result.summary).toEqual({ passed, total: 2 });
+
+    if (conclusion === 'unavailable') {
+      expect(result.conclusion.text).toContain('Saved status: unknown');
+      expect(result.conclusion.text).toContain(
+        'Element text evidence unavailable',
+      );
+    }
+  },
+);
+
+test('a regression in any journey decides the run and names that journey', async () => {
+  const side = async (count: number, id: string) =>
+    inspect(
+      (await syntheticBundle({ count, contract: { ...recipe, id, name: id } }))
+        .directory,
+    );
+  const journey = async (id: string, candidateCount: number) =>
+    compareJourney({
+      visual: pixelsNotInspected,
+      base: await side(1, id),
+      candidate: await side(candidateCount, id),
+      evaluatedAt,
+    });
+
+  const result = summarizeJourneys({
+    journeys: [await journey('Browse', 1), await journey('Checkout', 4)],
+    evaluatedAt,
+    mode: 'comparison',
+  });
+
+  expect(result.journeys.map((item) => item.conclusion.kind)).toEqual([
+    'no-regression',
+    'regression',
+  ]);
+  expect(result.conclusion.kind).toBe('regression');
+  expect(result.conclusion.text).toMatch(/^Checkout: /);
+  expect(result.summary).toEqual({ passed: 1, total: 2 });
+  expect(
+    Schema.decodeUnknownSync(comparisonSchema)(JSON.parse(json(result))),
+  ).toEqual(result);
+});
+
+test('evidence recorded under different conditions is not comparable', async () => {
+  const base = await syntheticBundle({
+    contract: twoChecks,
+    text: statusText('Saved'),
+  });
+  const candidate = await syntheticBundle({
+    contract: twoChecks,
+    text: statusText('Saved'),
+  });
+
+  await saveManifest(candidate.directory, {
+    ...candidate.capture,
+    evidence: candidate.capture.evidence.map((entry) =>
+      entry.status === 'recorded'
+        ? { ...entry, conditions: { samples: 3 } }
+        : entry,
+    ),
+  });
+
+  const result = compareJourney({
+    visual: pixelsNotInspected,
+    base: await inspect(base.directory),
+    candidate: await inspect(candidate.directory),
+    evaluatedAt,
+  });
+
+  expect(result.comparison).toMatchObject({
+    kind: 'unavailable',
+    reasons: [
+      'text evidence was recorded under different versions or conditions',
+    ],
+  });
+  expect(result.conclusion.kind).toBe('unavailable');
+});
+
+test('evidence whose file changed after capture leaves its check unknown, not passed', async () => {
+  const bundle = await syntheticBundle({
+    contract: twoChecks,
+    text: statusText('Saved'),
+  });
+
+  await writeFile(
+    path.join(bundle.directory, 'evidence/text.json'),
+    json({ kind: 'text', schemaVersion: 1, value: statusText('Saved', 2) }),
+  );
+
+  const side = await inspect(bundle.directory);
+
+  expect(side.execution).toBe('unavailable');
+  expect(side.checks.map((check) => check.outcome)).toEqual([
+    'unknown',
+    'unknown',
+  ]);
+});
+
+const sameText = defineCheck({
+  definition: Schema.Struct({
+    kind: Schema.Literal('same-text'),
+    id: Schema.String,
+    name: Schema.String,
+    scope: Schema.String,
+  }),
+  evidence: ['text'],
+  collectors: () => [],
+  expectation: () => 'The candidate shows the base text.',
+  needsBase: true,
+  evaluate: ({ base, candidate }) => {
+    const value = (input: CheckInput<'text'>) =>
+      input.evidence.text.elements[0]?.value ?? null;
+
+    if (base === null) {
+      return {
+        base: null,
+        candidate: { outcome: 'not-run', actual: null, detail: 'No base.' },
+      };
+    }
+
+    return {
+      base: { outcome: 'passed', actual: value(base), detail: 'Reference.' },
+      candidate: {
+        outcome: value(base) === value(candidate) ? 'passed' : 'failed',
+        actual: value(candidate),
+        detail: 'Compared with the base.',
+      },
+    };
+  },
+});
+
+const newValues = defineCheck({
+  definition: sameText.definition,
+  evidence: sameText.evidence,
+  collectors: sameText.collectors,
+  expectation: sameText.expectation,
+  evaluate: perSide((_, side: CheckInput<'text'>) => ({
+    outcome: 'failed',
+    actual: side.evidence.text.elements.length,
+    detail: 'Some values are wrong.',
+  })),
+  regression: ({ base, candidate }) =>
+    candidate.evidence.text.elements.length > base.evidence.text.elements.length
+      ? { detail: 'The candidate shows a value the base did not.' }
+      : null,
+});
+
+const probe = {
+  kind: 'same-text',
+  id: 'same',
+  name: 'Same text',
+  scope: 'After saving',
+} as const;
+
+async function completeSide(text?: EvidenceValue<'text'>) {
+  const side = await inspect(
+    (
+      await syntheticBundle({
+        contract: twoChecks,
+        ...(text === undefined ? {} : { text }),
+      })
+    ).directory,
+  );
+
+  if (side.execution !== 'complete') {
+    throw new Error('A complete synthetic side is expected');
+  }
+
+  return side;
+}
+
+test('a check that compares sides is unknown without a usable, comparable base', async () => {
+  const candidate = await completeSide(statusText('Saved'));
+  const cases = [
+    {
+      base: await completeSide(),
+      comparable: true,
+      detail: 'Base: Element text evidence unavailable',
+    },
+    {
+      base: await completeSide(statusText('Saved')),
+      comparable: false,
+      detail: 'Base: not comparable with the candidate',
+    },
+    { base: null, comparable: false, detail: 'Base: capture unavailable' },
+  ];
+
+  for (const { base, comparable, detail } of cases) {
+    const pair = evaluateCheck(sameText, probe, {
+      base,
+      candidate,
+      mode: 'comparison',
+      comparable,
+    });
+
+    expect(pair.candidate.outcome).toBe('unknown');
+    expect(pair.candidate.detail).toContain(detail);
+    expect(pair.regression).toBeNull();
+  }
+
+  expect(
+    evaluateCheck(sameText, probe, {
+      base: null,
+      candidate,
+      mode: 'preview',
+      comparable: false,
+    }).candidate.outcome,
+  ).toBe('not-run');
+  expect(
+    evaluateCheck(sameText, probe, {
+      base: await completeSide(statusText('Pending')),
+      candidate,
+      mode: 'comparison',
+      comparable: true,
+    }).candidate,
+  ).toMatchObject({ outcome: 'failed', actual: 'Saved' });
+});
+
+test('a regression hook decides failed-to-failed pairs and never runs without base evidence', async () => {
+  const two = {
+    elements: [
+      { selector: '#status', count: 1, value: 'Saved' },
+      { selector: '#total', count: 1, value: '3' },
+    ],
+  };
+  const pair = (base: Awaited<ReturnType<typeof completeSide>>) =>
+    evaluateCheck(newValues, probe, {
+      base,
+      candidate,
+      mode: 'comparison',
+      comparable: true,
+    });
+  const candidate = await completeSide(two);
+
+  expect(pair(await completeSide(statusText('Saved')))).toMatchObject({
+    base: { outcome: 'failed' },
+    candidate: { outcome: 'failed' },
+    regression: 'The candidate shows a value the base did not.',
+  });
+  expect(pair(await completeSide(two)).regression).toBeNull();
+  expect(pair(await completeSide())).toMatchObject({
+    candidate: { outcome: 'unknown' },
+    regression: null,
+  });
 });

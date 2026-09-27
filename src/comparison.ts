@@ -1,4 +1,3 @@
-import { checkLabels } from './result-text';
 import { DateTime, Effect, Schema } from 'effect';
 import { readFile, realpath } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
@@ -11,16 +10,36 @@ import {
   type Observations,
 } from './capture/model';
 import { parseRecipe, type Recipe } from './capture/recipe';
+import { checkKinds, type CheckDefinition, type CheckKinds } from './checks';
+import type {
+  CheckIdentity,
+  CheckInput,
+  CheckKind,
+  Evaluation,
+} from './checks/define';
+import {
+  evidenceKinds,
+  evidenceViewSchema,
+  isEvidenceKind,
+  type EvidenceKind,
+  type EvidenceView,
+} from './evidence-kinds';
 import { json, sha256 } from './encoding';
+import path from 'node:path';
 import type {
   Check,
+  CheckVerdict,
   Comparison,
+  Conclusion,
+  Journey,
+  JourneySelection,
   Selection,
   Side,
   SideArtifact,
   UnknownCheck,
   Visual,
 } from './comparison-model';
+import { conclusionKinds, resultSchemaVersion } from './comparison-model';
 import {
   inspectArtifact,
   readVerifiedArtifact,
@@ -52,94 +71,242 @@ type InspectSideOptions = {
   expected?: Expected;
 };
 
-function expectation(recipe: Recipe | null): string {
-  const definition = recipe?.check;
+function expectationFor<K extends CheckDefinition['kind']>(
+  definition: Extract<CheckDefinition, { kind: K }>,
+): string {
+  const kind: CheckKinds[K] = checkKinds[definition.kind];
 
-  if (definition === undefined || definition === null) {
-    return 'No named expectation available.';
-  }
-
-  if (definition.kind === 'request-count') {
-    return `Exactly ${definition.expectedCount} ${definition.method} ${definition.origin ?? ''}${definition.path} request(s) with status ${definition.status}.`;
-  }
-
-  return `Exactly one ${definition.selector} element with text ${JSON.stringify(definition.expectedText)}.`;
+  return kind.expectation(definition);
 }
 
-function unknownCheck(
+function unknownChecks(
   detail: string,
   recipe: Recipe | null = null,
-): UnknownCheck {
-  const definition = recipe?.check;
+): UnknownCheck[] {
+  if (recipe === null) {
+    return [
+      {
+        id: 'capture-evidence',
+        name: 'Capture evidence',
+        authority: 'Executed by Observed',
+        scope: 'The configured page and recorded capture window.',
+        expectation: 'No named expectation available.',
+        outcome: 'unknown',
+        actual: null,
+        detail,
+      },
+    ];
+  }
 
-  return {
-    id: definition?.id ?? 'capture-evidence',
-    name: definition?.name ?? 'Capture evidence',
+  return recipe.checks.map((definition) => ({
+    id: definition.id,
+    name: definition.name,
     authority: 'Executed by Observed',
-    scope:
-      definition?.scope ?? 'The configured page and recorded capture window.',
-    expectation: expectation(recipe),
+    scope: definition.scope,
+    expectation: expectationFor(definition),
     outcome: 'unknown',
     actual: null,
     detail,
+  }));
+}
+
+function sideDetail(side: Side): string {
+  const unknown = side.checks.find((check) => check.outcome === 'unknown');
+
+  return unknown?.detail ?? side.unresolved.join('; ');
+}
+
+type CompleteSide = Extract<Side, { execution: 'complete' }>;
+
+// Declared evidence for one check on one side, or why it is missing.
+function checkInput(
+  side: CompleteSide,
+  kinds: readonly EvidenceKind[],
+):
+  | { kind: 'ready'; input: CheckInput<EvidenceKind> }
+  | { kind: 'missing'; detail: string } {
+  const evidence: Partial<Record<EvidenceKind, unknown>> = {};
+
+  for (const kind of kinds) {
+    const view = side.evidence.find((item) => item.kind === kind);
+
+    if (view === undefined || view.status === 'unavailable') {
+      return {
+        kind: 'missing',
+        detail: `${evidenceKinds[kind].title} evidence unavailable: ${view?.reason ?? 'not recorded'}`,
+      };
+    }
+
+    evidence[kind] = view.value;
+  }
+
+  return {
+    kind: 'ready',
+    input: {
+      observations: side.observations,
+      // The loop above recorded every declared kind, and an evaluator's type
+      // lets it read only the kinds it declared.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+      evidence: evidence as CheckInput<EvidenceKind>['evidence'],
+    },
   };
 }
 
-function evaluateCheck(recipe: Recipe, observations: Observations): Check {
-  const definition = recipe.check;
-  const common = unknownCheck('Required check observation unavailable', recipe);
+function checkResult(
+  definition: CheckIdentity,
+  expectation: string,
+  evaluation: Evaluation,
+): Check {
+  const identity = {
+    id: definition.id,
+    name: definition.name,
+    authority: 'Executed by Observed',
+    scope: definition.scope,
+    expectation,
+    detail: evaluation.detail,
+  } as const;
 
-  if (definition === null) {
-    return {
-      ...common,
-      name: 'No check configured',
-      outcome: 'not-run',
-      detail:
-        'These captures show the application. No correctness check was configured.',
-    };
-  }
+  return evaluation.outcome === 'passed' || evaluation.outcome === 'failed'
+    ? { ...identity, outcome: evaluation.outcome, actual: evaluation.actual }
+    : { ...identity, outcome: evaluation.outcome, actual: null };
+}
 
-  if (definition.kind === 'text') {
-    const observed = observations.text;
+export type CheckPair = {
+  base: Check | null;
+  candidate: Check;
+  // Set when a comparable, known pair establishes a regression.
+  regression: string | null;
+};
 
-    if (observed === undefined || observed.selector !== definition.selector) {
-      return common;
+const unknownEvaluation = (detail: string): Evaluation => ({
+  outcome: 'unknown',
+  actual: null,
+  detail,
+});
+
+function describeActual(check: Check | undefined): string {
+  return check === undefined || check.actual === null
+    ? 'unknown'
+    : String(check.actual);
+}
+
+// Evaluates one configured check on both sides through its kind. Missing
+// declared evidence makes that side unknown before the kind sees it, and a
+// kind that compares the sides gets no verdict from an unusable base.
+export function evaluateCheck<D extends CheckIdentity>(
+  kind: CheckKind<D, EvidenceKind>,
+  definition: D,
+  {
+    base,
+    candidate,
+    mode,
+    comparable,
+  }: {
+    base: CompleteSide | null;
+    candidate: CompleteSide;
+    mode: 'preview' | 'comparison';
+    comparable: boolean;
+  },
+): CheckPair {
+  const expectation = kind.expectation(definition);
+  const baseInput = base === null ? null : checkInput(base, kind.evidence);
+  const candidateInput = checkInput(candidate, kind.evidence);
+  const readBase = baseInput?.kind === 'ready' ? baseInput.input : null;
+  const comparesSides =
+    kind.needsBase === true || kind.regression !== undefined;
+  let blocked: string | null = null;
+
+  if (mode === 'comparison' && comparesSides) {
+    if (baseInput === null) {
+      blocked = 'Base: capture unavailable';
+    } else if (baseInput.kind === 'missing') {
+      blocked = `Base: ${baseInput.detail}`;
+    } else if (!comparable) {
+      blocked = 'Base: not comparable with the candidate';
     }
-
-    return {
-      ...common,
-      outcome:
-        observed.count === 1 && observed.value === definition.expectedText
-          ? 'passed'
-          : 'failed',
-      actual: observed.value,
-      detail: `Matched ${observed.count} element(s); text: ${JSON.stringify(observed.value)}.`,
-    };
   }
 
-  const requests = observations.requests.filter(
-    (request) =>
-      request.method === definition.method &&
-      request.path === definition.path &&
-      request.origin === (definition.origin ?? 'application'),
-  );
-  const successful = requests.every(
-    (request) => request.status === definition.status,
-  );
-  const statuses =
-    requests.length === 0
-      ? 'none'
-      : requests.map((request) => request.status).join(', ');
+  let candidateEvaluation: Evaluation;
+  let baseEvaluation: Evaluation | null = null;
 
-  return {
-    ...common,
-    outcome:
-      requests.length === definition.expectedCount && successful
-        ? 'passed'
-        : 'failed',
-    actual: requests.length,
-    detail: `Observed ${requests.length} matching ${definition.method} ${definition.origin ?? ''}${definition.path} request(s); statuses: ${statuses}.`,
-  };
+  if (candidateInput.kind === 'missing') {
+    candidateEvaluation = unknownEvaluation(candidateInput.detail);
+  } else if (blocked !== null) {
+    candidateEvaluation = unknownEvaluation(blocked);
+  } else {
+    const evaluated = kind.evaluate({
+      definition,
+      base: readBase,
+      candidate: candidateInput.input,
+      comparable,
+    });
+    candidateEvaluation = evaluated.candidate;
+    baseEvaluation = evaluated.base;
+  }
+
+  if (baseInput?.kind === 'missing') {
+    baseEvaluation = unknownEvaluation(baseInput.detail);
+  } else if (readBase !== null && baseEvaluation === null) {
+    baseEvaluation = kind.evaluate({
+      definition,
+      base: null,
+      candidate: readBase,
+      comparable: false,
+    }).candidate;
+  }
+
+  const before =
+    baseEvaluation === null
+      ? null
+      : checkResult(definition, expectation, baseEvaluation);
+  const after = checkResult(definition, expectation, candidateEvaluation);
+  let regression: string | null = null;
+
+  if (
+    mode === 'comparison' &&
+    comparable &&
+    before !== null &&
+    readBase !== null &&
+    candidateInput.kind === 'ready' &&
+    (before.outcome === 'passed' || before.outcome === 'failed') &&
+    (after.outcome === 'passed' || after.outcome === 'failed')
+  ) {
+    if (kind.regression !== undefined && baseEvaluation !== null) {
+      regression =
+        kind.regression({
+          definition,
+          base: { ...readBase, evaluation: baseEvaluation },
+          candidate: {
+            ...candidateInput.input,
+            evaluation: candidateEvaluation,
+          },
+        })?.detail ?? null;
+    } else if (before.outcome === 'passed' && after.outcome === 'failed') {
+      regression = `${after.name} passed on base and failed on candidate. Base: ${describeActual(before)}; candidate: ${describeActual(after)}. ${expectation}`;
+    }
+  }
+
+  return { base: before, candidate: after, regression };
+}
+
+function evaluateDefinition<K extends CheckDefinition['kind']>(
+  definition: Extract<CheckDefinition, { kind: K }>,
+  sides: Parameters<typeof evaluateCheck>[2],
+): CheckPair {
+  const kind: CheckKinds[K] = checkKinds[definition.kind];
+
+  return evaluateCheck(kind, definition, sides);
+}
+
+function evaluatePairs(
+  base: CompleteSide | null,
+  candidate: CompleteSide,
+  mode: 'preview' | 'comparison',
+  comparable: boolean,
+): CheckPair[] {
+  return candidate.recipe.checks.map((definition) =>
+    evaluateDefinition(definition, { base, candidate, mode, comparable }),
+  );
 }
 
 function comparableConditions(capture: Capture) {
@@ -150,68 +317,100 @@ function comparableConditions(capture: Capture) {
   return { ...capture.conditions.value, dependenciesHash: null };
 }
 
-function conclusion(
-  base: Side,
-  candidate: Side,
-  regression: boolean,
-): Comparison['conclusion'] {
-  if (candidate.check.outcome === 'not-run') {
-    return {
-      kind: 'not-checked',
-      text: 'Before and after captured. No named check is configured, so no behavior was verified.',
-    };
-  }
-
-  if (regression) {
-    return {
-      kind: 'regression',
-      text: `${candidate.check.name} passed on base and failed on candidate. Base: ${String(base.check.actual)}; candidate: ${String(candidate.check.actual)}. ${candidate.check.expectation}`,
-    };
-  }
-
-  if (candidate.check.outcome === 'failed') {
-    return {
-      kind: 'check-failed',
-      text: `${candidate.check.name} failed. Base also failed, so this is not a regression. Base: ${String(base.check.actual)}; candidate: ${String(candidate.check.actual)}. ${candidate.check.expectation}`,
-    };
-  }
-
-  return {
-    kind: 'no-regression',
-    text:
-      base.check.outcome === 'passed'
-        ? `${candidate.check.name} passed on base and candidate.`
-        : `${candidate.check.name} failed on base and passed on candidate.`,
-  };
-}
-
-function previewConclusion(check: Check): Comparison['conclusion'] {
-  switch (check.outcome) {
-    case 'not-run':
-      return { kind: 'preview', text: 'Current application capture.' };
-    case 'passed':
-      return { kind: 'preview', text: `${check.name}: passed.` };
-    case 'failed':
-      return { kind: 'check-failed', text: `${check.name}: failed.` };
-    case 'unknown':
-      return {
-        kind: 'unavailable',
-        text: `${check.name}: unknown. ${check.detail}`,
-      };
-  }
-}
-
 function unavailable(reason: string): Side {
   return {
     execution: 'unavailable',
     capture: null,
     recipe: null,
     screenshot: null,
-    check: unknownCheck(reason),
+    checks: unknownChecks(reason),
     artifacts: [],
     unresolved: [reason],
   };
 }
+
+const isEvidenceView = Schema.is(evidenceViewSchema);
+
+const parseEvidenceFile = Effect.fnUntraced(function* (
+  kind: EvidenceKind,
+  input: string,
+) {
+  const definition = evidenceKinds[kind];
+  const malformed: EvidenceView = {
+    kind,
+    status: 'unavailable',
+    reason: `Evidence file is malformed or not schema version ${definition.schemaVersion}`,
+  };
+  const file = yield* Schema.decodeUnknownEffect(
+    Schema.fromJsonString(definition.file),
+    { onExcessProperty: 'error' },
+  )(input).pipe(
+    Effect.map((decoded) => decoded.value),
+    Effect.catchTag('SchemaError', () => Effect.succeed(undefined)),
+  );
+  const view = { kind, status: 'recorded', value: file };
+
+  return file !== undefined && isEvidenceView(view) ? view : malformed;
+});
+
+const evidenceViews = Effect.fnUntraced(function* (
+  capture: Capture,
+  recipe: Recipe,
+  byPath: ReadonlyMap<string, ArtifactResult>,
+) {
+  const views: EvidenceView[] = [];
+
+  for (const entry of capture.evidence) {
+    if (!isEvidenceKind(entry.kind)) {
+      views.push({
+        kind: entry.kind,
+        status: 'unavailable',
+        reason: 'This Observed does not support this evidence kind',
+      });
+    } else if (entry.status === 'unavailable') {
+      views.push({
+        kind: entry.kind,
+        status: 'unavailable',
+        reason: entry.reason,
+      });
+    } else if (
+      entry.schemaVersion !== evidenceKinds[entry.kind].schemaVersion
+    ) {
+      views.push({
+        kind: entry.kind,
+        status: 'unavailable',
+        reason: `Evidence schema version ${entry.schemaVersion} is unsupported`,
+      });
+    } else {
+      const artifact = byPath.get(entry.path);
+      const read =
+        artifact?.kind === 'available' && artifact.hash === entry.sha256
+          ? yield* readVerifiedText(artifact)
+          : ({
+              kind: 'unavailable',
+              reason: 'Evidence artifact is missing or changed',
+            } as const);
+
+      views.push(
+        read.kind === 'available'
+          ? yield* parseEvidenceFile(entry.kind, read.text)
+          : { kind: entry.kind, status: 'unavailable', reason: read.reason },
+      );
+    }
+  }
+
+  for (const collector of recipe.collectors) {
+    if (!views.some((view) => view.kind === collector.kind)) {
+      views.push({
+        kind: collector.kind,
+        status: 'unavailable',
+        reason: 'The capture recorded no evidence of this kind',
+      });
+    }
+  }
+
+  return views;
+});
 
 const isRelativePath = Schema.is(relativePathSchema);
 const safeRelativePath = (value: string): boolean => isRelativePath(value);
@@ -549,7 +748,7 @@ export const inspectSide = Effect.fn('inspectSide')(function* ({
         ) ?? []),
       ],
     };
-    const check = unknownCheck(
+    const checks = unknownChecks(
       reasons.length === 0
         ? 'Verified observations unavailable'
         : reasons.join('; '),
@@ -561,8 +760,10 @@ export const inspectSide = Effect.fn('inspectSide')(function* ({
         execution: 'capture-failed',
         capture: captured,
         recipe,
+        evidence:
+          recipe === null ? [] : yield* evidenceViews(capture, recipe, byPath),
         screenshot,
-        check,
+        checks,
         ...evidence,
       } satisfies Side;
     }
@@ -573,14 +774,24 @@ export const inspectSide = Effect.fn('inspectSide')(function* ({
       recipe !== null &&
       screenshot !== null
     ) {
-      return {
+      const views = yield* evidenceViews(capture, recipe, byPath);
+
+      const side = {
         execution: 'complete',
         capture: captured,
         recipe,
         observations,
+        evidence: views,
         screenshot,
-        check: evaluateCheck(recipe, observations),
+        checks: [],
         ...evidence,
+      } satisfies Side;
+
+      return {
+        ...side,
+        checks: evaluatePairs(null, side, 'preview', false).map(
+          (pair) => pair.candidate,
+        ),
       } satisfies Side;
     }
 
@@ -589,7 +800,7 @@ export const inspectSide = Effect.fn('inspectSide')(function* ({
       capture: captured,
       recipe,
       screenshot,
-      check,
+      checks,
       ...evidence,
     } satisfies Side;
   }).pipe(
@@ -621,10 +832,20 @@ function sideAt(side: Side, evaluatedAt: string): Side {
     capture: side.capture,
     recipe: side.recipe,
     screenshot: side.screenshot,
-    check: unknownCheck(reasons.join('; '), side.recipe),
+    checks: unknownChecks(reasons.join('; '), side.recipe),
     artifacts: side.artifacts,
     unresolved: [...side.unresolved, ...reasons],
   };
+}
+
+function evidenceIdentity(entry: Capture['evidence'][number]) {
+  return entry.status === 'recorded'
+    ? {
+        schemaVersion: entry.schemaVersion,
+        producer: entry.producer,
+        conditions: entry.conditions,
+      }
+    : { schemaVersion: entry.schemaVersion, producer: entry.producer };
 }
 
 function comparisonProblems(base: Side, candidate: Side): string[] {
@@ -636,10 +857,9 @@ function comparisonProblems(base: Side, candidate: Side): string[] {
   ] as const) {
     if (
       side.execution !== 'complete' ||
-      side.check.outcome === 'unknown' ||
       side.artifacts.some((artifact) => artifact.integrity !== 'verified')
     ) {
-      reasons.push(`${name} unavailable: ${side.check.detail}`);
+      reasons.push(`${name} unavailable: ${sideDetail(side)}`);
     }
   }
 
@@ -674,7 +894,26 @@ function comparisonProblems(base: Side, candidate: Side): string[] {
       reasons.push('Capture conditions differ');
     }
 
-    if (base.check.id !== candidate.check.id) {
+    for (const entry of after.evidence) {
+      const other = before.evidence.find((item) => item.kind === entry.kind);
+
+      if (
+        other !== undefined &&
+        other.status === entry.status &&
+        !isDeepStrictEqual(evidenceIdentity(other), evidenceIdentity(entry))
+      ) {
+        reasons.push(
+          `${entry.kind} evidence was recorded under different versions or conditions`,
+        );
+      }
+    }
+
+    if (
+      !isDeepStrictEqual(
+        base.checks.map((check) => check.id),
+        candidate.checks.map((check) => check.id),
+      )
+    ) {
       reasons.push('Named check identities differ');
     }
   }
@@ -733,7 +972,168 @@ function observedSourceNotes(base: Side, candidate: Side): string[] {
   return notes;
 }
 
-export function compareCaptures({
+function verdictsFor(
+  pairs: readonly CheckPair[] | null,
+  candidate: Side,
+): CheckVerdict[] {
+  const identity = (check: Check) => ({
+    id: check.id,
+    name: check.name,
+    scope: check.scope,
+    expectation: check.expectation,
+  });
+
+  if (pairs === null) {
+    return candidate.checks.map((check) => ({
+      ...identity(check),
+      verdict: 'unknown',
+      detail: check.detail,
+    }));
+  }
+
+  return pairs.map(({ candidate: check, regression }) => {
+    const common = identity(check);
+
+    if (regression !== null) {
+      return { ...common, verdict: 'regression', detail: regression };
+    }
+
+    return { ...common, verdict: check.outcome, detail: check.detail };
+  });
+}
+
+function names(verdicts: readonly CheckVerdict[]): string {
+  return verdicts.map((verdict) => verdict.name).join(', ');
+}
+
+function journeyConclusion(
+  base: Side,
+  candidate: Side,
+  verdicts: readonly CheckVerdict[],
+  comparison: Journey['comparison'],
+  mode: 'preview' | 'comparison',
+): Conclusion {
+  const regressions = verdicts.filter((item) => item.verdict === 'regression');
+  const failed = verdicts.filter((item) => item.verdict === 'failed');
+  const unknown = verdicts.filter((item) => item.verdict === 'unknown');
+  const passed = verdicts.filter((item) => item.verdict === 'passed');
+  const notRun = verdicts.filter((item) => item.verdict === 'not-run');
+  const notRunText = notRun.length === 0 ? '' : ` Not run: ${names(notRun)}.`;
+  const baseCheck = (id: string) =>
+    base.checks.find((check) => check.id === id);
+  const candidateCheck = (id: string) =>
+    candidate.checks.find((check) => check.id === id);
+  const baseOutcome = (id: string) =>
+    ({
+      passed: 'passed',
+      failed: 'failed',
+      'not-run': 'was not run',
+      unknown: 'was unknown',
+    })[baseCheck(id)?.outcome ?? 'unknown'];
+
+  if (regressions.length > 0) {
+    return {
+      kind: 'regression',
+      text: regressions.map((item) => item.detail).join(' '),
+    };
+  }
+
+  if (failed.length > 0) {
+    return {
+      kind: 'check-failed',
+      text: failed
+        .map((item) => {
+          const after = candidateCheck(item.id);
+
+          if (mode === 'preview') {
+            return `${item.name}: failed.`;
+          }
+
+          if (comparison.kind !== 'available') {
+            return `${item.name} failed. The revisions were not compared, so a regression cannot be established. Candidate: ${describeActual(after)}. ${item.expectation}`;
+          }
+
+          const readings = {
+            failed: 'Base also failed, so this is not a regression.',
+            passed:
+              "Base passed, but the check's regression rule found no regression.",
+            'not-run':
+              'Base was not run, so a regression cannot be established.',
+            unknown: 'Base was unknown, so a regression cannot be established.',
+          } as const;
+          const reading = readings[baseCheck(item.id)?.outcome ?? 'unknown'];
+
+          return `${item.name} failed. ${reading} Base: ${describeActual(baseCheck(item.id))}; candidate: ${describeActual(after)}. ${item.expectation}`;
+        })
+        .join(' '),
+    };
+  }
+
+  if (mode === 'preview' && candidate.execution !== 'complete') {
+    return {
+      kind: 'unavailable',
+      text: 'The capture is unavailable. Nothing was checked.',
+    };
+  }
+
+  if (comparison.kind === 'unavailable') {
+    return {
+      kind: 'unavailable',
+      text:
+        unknown.length > 0
+          ? `The revisions were not compared. Unknown: ${names(unknown)}.`
+          : `The revisions were not compared.${verdicts.length === 0 ? '' : ` ${passed.length} of ${verdicts.length} candidate checks passed.`}${notRunText}`,
+    };
+  }
+
+  if (unknown.length > 0) {
+    return {
+      kind: 'unavailable',
+      text: unknown
+        .map((item) => `${item.name}: unknown. ${item.detail}`)
+        .join(' ')
+        .concat(notRunText),
+    };
+  }
+
+  if (passed.length === 0) {
+    if (mode === 'preview') {
+      return {
+        kind: 'preview',
+        text: `Current application capture.${notRunText}`,
+      };
+    }
+
+    return {
+      kind: 'not-checked',
+      text:
+        notRun.length === 0
+          ? 'Before and after captured. No named check is configured, so no behavior was verified.'
+          : `Before and after captured. No named check ran, so no behavior was verified.${notRunText}`,
+    };
+  }
+
+  if (mode === 'preview') {
+    return {
+      kind: 'preview',
+      text: `${passed.map((item) => `${item.name}: passed.`).join(' ')}${notRunText}`,
+    };
+  }
+
+  return {
+    kind: 'no-regression',
+    text: passed
+      .map((item) =>
+        baseOutcome(item.id) === 'passed'
+          ? `${item.name} passed on base and candidate.`
+          : `${item.name} ${baseOutcome(item.id)} on base and passed on candidate.`,
+      )
+      .join(' ')
+      .concat(notRunText),
+  };
+}
+
+export function compareJourney({
   base: inspectedBase,
   candidate: inspectedCandidate,
   evaluatedAt,
@@ -745,84 +1145,36 @@ export function compareCaptures({
   evaluatedAt: string;
   visual: Visual;
   mode?: 'preview' | 'comparison';
-}): Comparison {
+}): Journey {
   const base = sideAt(inspectedBase, evaluatedAt);
   const candidate = sideAt(inspectedCandidate, evaluatedAt);
-  const reasons = comparisonProblems(base, candidate);
-  const firstReason = reasons[0];
+  const reasons =
+    mode === 'comparison' ? comparisonProblems(base, candidate) : [];
+  const [firstReason, ...otherReasons] = reasons;
 
-  const common = {
-    schemaVersion: 5,
-    mode,
-    title: candidate.recipe?.name ?? base.recipe?.name ?? 'Before and after',
-    evaluatedAt,
-    base,
-    candidate,
-    limitations: [
-      candidate.recipe?.check?.scope ??
-        'Only the configured page and recorded capture window were captured.',
-      'Checks cover only their stated expectations. Browser errors remain available as evidence.',
-      'Screenshot differences are observations of rendered pixels, not a visual regression.',
-      'Artifact hashes detect changed bytes; they do not establish collector honesty or source causation.',
-      ...(mode === 'comparison' ? observedSourceNotes(base, candidate) : []),
-    ],
-  } as const;
+  let comparison: Journey['comparison'];
 
   if (mode === 'preview' && candidate.execution === 'complete') {
-    return {
-      ...common,
-      comparison: { kind: 'preview' },
-      conclusion: previewConclusion(candidate.check),
+    comparison = { kind: 'preview' };
+  } else if (mode === 'preview') {
+    comparison = {
+      kind: 'unavailable',
+      reasons: [`Capture unavailable: ${sideDetail(candidate)}`],
     };
-  }
-
-  if (mode === 'preview') {
-    return {
-      ...common,
-      comparison: {
-        kind: 'unavailable',
-        reasons: [`Capture unavailable: ${candidate.check.detail}`],
-      },
-      conclusion: {
-        kind: 'unavailable',
-        text: 'The capture is unavailable. Nothing was checked.',
-      },
-    };
-  }
-
-  if (
+  } else if (
     firstReason !== undefined ||
     base.execution !== 'complete' ||
     candidate.execution !== 'complete'
   ) {
-    return {
-      ...common,
-      comparison: {
-        kind: 'unavailable',
-        reasons: [
-          firstReason ?? 'Comparable captures unavailable',
-          ...reasons.slice(1),
-        ],
-      },
-      conclusion:
-        candidate.check.outcome === 'failed'
-          ? {
-              kind: 'check-failed',
-              text: `${candidate.check.name} failed. The revisions were not compared, so a regression cannot be established. Candidate: ${String(candidate.check.actual)}. ${candidate.check.expectation}`,
-            }
-          : {
-              kind: 'unavailable',
-              text: `The revisions were not compared. Candidate check: ${checkLabels[candidate.check.outcome].toLowerCase()}.`,
-            },
+    comparison = {
+      kind: 'unavailable',
+      reasons: [
+        firstReason ?? 'Comparable captures unavailable',
+        ...otherReasons,
+      ],
     };
-  }
-
-  const regression =
-    base.check.outcome === 'passed' && candidate.check.outcome === 'failed';
-
-  return {
-    ...common,
-    comparison: {
+  } else {
+    comparison = {
       kind: 'available',
       basis:
         'Complete, intact captures with the same protected recipe, application, producer, Observed version, and recorded conditions.',
@@ -830,9 +1182,114 @@ export function compareCaptures({
         candidate.observations.requests.length -
         base.observations.requests.length,
       visual,
-    },
-    conclusion: conclusion(base, candidate, regression),
+    };
+  }
+
+  const pairs =
+    candidate.execution === 'complete'
+      ? evaluatePairs(
+          mode === 'comparison' && base.execution === 'complete' ? base : null,
+          candidate,
+          mode,
+          comparison.kind === 'available',
+        )
+      : null;
+  const verdicts = verdictsFor(pairs, candidate);
+  const withChecks = (side: Side, checks: Check[] | undefined): Side =>
+    checks === undefined || side.execution !== 'complete'
+      ? side
+      : { ...side, checks };
+
+  const evaluatedBase = withChecks(
+    base,
+    pairs?.every((pair) => pair.base !== null) === true
+      ? pairs.flatMap((pair) => (pair.base === null ? [] : [pair.base]))
+      : undefined,
+  );
+  const evaluatedCandidate = withChecks(
+    candidate,
+    pairs?.map((pair) => pair.candidate),
+  );
+
+  return {
+    title: candidate.recipe?.name ?? base.recipe?.name ?? 'Before and after',
+    base: evaluatedBase,
+    candidate: evaluatedCandidate,
+    comparison,
+    checks: verdicts,
+    conclusion: journeyConclusion(
+      evaluatedBase,
+      evaluatedCandidate,
+      verdicts,
+      comparison,
+      mode,
+    ),
+    limitations: [
+      'Checks cover only their stated expectations and scopes. Browser errors remain available as evidence.',
+      'Screenshot differences are observations of rendered pixels, not a visual regression.',
+      'Artifact hashes detect changed bytes; they do not establish collector honesty or source causation.',
+      ...(mode === 'comparison' ? observedSourceNotes(base, candidate) : []),
+    ],
   };
+}
+
+export function summarizeJourneys({
+  journeys,
+  evaluatedAt,
+  mode,
+}: {
+  journeys: readonly [Journey, ...Journey[]];
+  evaluatedAt: string;
+  mode: 'preview' | 'comparison';
+}): Comparison {
+  const [first] = journeys;
+  const kind =
+    conclusionKinds.find((candidate) =>
+      journeys.some((journey) => journey.conclusion.kind === candidate),
+    ) ?? first.conclusion.kind;
+  const deciding = journeys.filter(
+    (journey) => journey.conclusion.kind === kind,
+  );
+  const verdicts = journeys.flatMap((journey) => journey.checks);
+
+  return {
+    schemaVersion: resultSchemaVersion,
+    mode,
+    title:
+      journeys.length === 1
+        ? first.title
+        : (first.candidate.capture?.manifest.application ??
+          `${journeys.length} journeys`),
+    evaluatedAt,
+    journeys,
+    summary: {
+      passed: verdicts.filter((item) => item.verdict === 'passed').length,
+      total: verdicts.length,
+    },
+    conclusion: {
+      kind,
+      text:
+        journeys.length === 1
+          ? first.conclusion.text
+          : deciding
+              .map((journey) => `${journey.title}: ${journey.conclusion.text}`)
+              .join(' '),
+    },
+  };
+}
+
+export function compareCaptures(options: {
+  base: Side;
+  candidate: Side;
+  evaluatedAt: string;
+  visual: Visual;
+  mode?: 'preview' | 'comparison';
+}): Comparison {
+  return summarizeJourneys({
+    journeys: [compareJourney(options)],
+    evaluatedAt: options.evaluatedAt,
+    mode: options.mode ?? 'comparison',
+  });
 }
 
 function noVisual(reason: string): { visual: Visual; diff: null } {
@@ -908,22 +1365,26 @@ const inspectVisual = Effect.fnUntraced(
   ),
 );
 
-export const inspectComparison = Effect.fn('inspectComparison')(function* ({
+export const inspectJourney = Effect.fn('inspectJourney')(function* ({
   baseDirectory,
   candidateDirectory,
   evaluatedAt,
+  mode = 'comparison',
   selection,
 }: {
   baseDirectory: string | null;
   candidateDirectory: string;
   evaluatedAt: string;
-  selection?: Selection;
+  mode?: 'preview' | 'comparison';
+  selection?: JourneySelection;
 }) {
+  const prefix = (side: 'base' | 'candidate') =>
+    selection === undefined ? side : `${selection.directory}/${side}`;
   const base =
     selection?.baseIssue === undefined
       ? yield* inspectSide({
           directory: baseDirectory,
-          prefix: 'base',
+          prefix: prefix('base'),
           evaluatedAt,
           ...(selection === undefined || selection.base === null
             ? {}
@@ -931,7 +1392,7 @@ export const inspectComparison = Effect.fn('inspectComparison')(function* ({
         })
       : yield* inspectFailureSide(
           baseDirectory,
-          'base',
+          prefix('base'),
           selection.baseIssue,
           selection.baseFailureArtifacts,
         );
@@ -940,7 +1401,7 @@ export const inspectComparison = Effect.fn('inspectComparison')(function* ({
     selection?.candidateIssue === undefined
       ? yield* inspectSide({
           directory: candidateDirectory,
-          prefix: 'candidate',
+          prefix: prefix('candidate'),
           evaluatedAt,
           ...(selection === undefined || selection.candidate === null
             ? {}
@@ -948,26 +1409,74 @@ export const inspectComparison = Effect.fn('inspectComparison')(function* ({
         })
       : yield* inspectFailureSide(
           candidateDirectory,
-          'candidate',
+          prefix('candidate'),
           selection.candidateIssue,
           selection.candidateFailureArtifacts,
         );
 
-  const mode = selection?.mode ?? 'comparison';
   const pixels =
     mode === 'comparison'
       ? yield* inspectVisual(baseDirectory, candidateDirectory, base, candidate)
       : noVisual('Preview has no baseline');
-  const result = compareCaptures({
+  const diffPath =
+    selection === undefined
+      ? 'visual-diff.png'
+      : `${selection.directory}/visual-diff.png`;
+  const visual: Visual =
+    pixels.visual.kind === 'changed'
+      ? { ...pixels.visual, diff: { ...pixels.visual.diff, path: diffPath } }
+      : pixels.visual;
+  const journey = compareJourney({
     base,
     candidate,
     evaluatedAt,
-    visual: pixels.visual,
+    visual,
     mode,
   });
 
   return {
-    result,
-    visualDiff: result.comparison.kind === 'available' ? pixels.diff : null,
+    journey,
+    visualDiff:
+      journey.comparison.kind === 'available' && pixels.diff !== null
+        ? { path: diffPath, bytes: pixels.diff.bytes }
+        : null,
+  };
+});
+
+// Inspects each selected journey under root/<directory>/{base,candidate}.
+export const inspectComparison = Effect.fn('inspectComparison')(function* ({
+  root,
+  selection,
+}: {
+  root: string;
+  selection: Selection;
+}) {
+  const inspected = yield* Effect.forEach(selection.journeys, (journey) =>
+    inspectJourney({
+      baseDirectory:
+        selection.mode === 'preview'
+          ? null
+          : path.join(root, journey.directory, 'base'),
+      candidateDirectory: path.join(root, journey.directory, 'candidate'),
+      evaluatedAt: selection.evaluatedAt,
+      mode: selection.mode,
+      selection: journey,
+    }),
+  );
+  const [first, ...rest] = inspected.map((item) => item.journey);
+
+  if (first === undefined) {
+    return yield* Effect.die('A selection has at least one journey');
+  }
+
+  return {
+    result: summarizeJourneys({
+      journeys: [first, ...rest],
+      evaluatedAt: selection.evaluatedAt,
+      mode: selection.mode,
+    }),
+    visualDiffs: inspected.flatMap((item) =>
+      item.visualDiff === null ? [] : [item.visualDiff],
+    ),
   };
 });

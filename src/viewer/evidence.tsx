@@ -5,6 +5,7 @@ import { describeRevision, shortSource } from '../provenance-text';
 import { describeStatus } from '../request-text';
 import { describeRegion } from '../visual-text';
 import { fonts, geometry, media } from './constants.stylex';
+import { SubHeading } from './heading';
 import { colors } from './tokens.stylex';
 
 const styles = stylex.create({
@@ -165,18 +166,21 @@ export function Screenshot({
   side,
   label,
   highlight,
+  level = 2,
 }: {
   side: Side;
   label: string;
   highlight: Highlight | null;
+  level?: 2 | 3;
 }) {
   const [failed, setFailed] = useState(false);
   const resolve = use(EvidenceUrls);
   const capture = side.capture?.manifest ?? null;
+  const Heading = level === 2 ? 'h2' : 'h3';
 
   return (
     <figure {...stylex.props(styles.figure)}>
-      <h2 {...stylex.props(styles.heading)}>{label}</h2>
+      <Heading {...stylex.props(styles.heading)}>{label}</Heading>
       <p {...stylex.props(styles.caption)}>
         {capture?.label ?? 'No capture'}
         {capture === null ? null : (
@@ -245,7 +249,7 @@ export function RequestLedger({ side, label }: { side: Side; label: string }) {
       {...stylex.props(styles.stack)}
       aria-label={`${label} request ledger`}
     >
-      <h3 {...stylex.props(styles.heading)}>{label}</h3>
+      <SubHeading xstyle={styles.heading}>{label}</SubHeading>
       {observations === null ? (
         <p {...stylex.props(styles.missing)}>Request evidence unavailable.</p>
       ) : (
@@ -346,7 +350,7 @@ export function Artifacts({ side, label }: { side: Side; label: string }) {
       {...stylex.props(styles.stack)}
       aria-label={`${label} original artifacts`}
     >
-      <h3 {...stylex.props(styles.heading)}>{label}</h3>
+      <SubHeading xstyle={styles.heading}>{label}</SubHeading>
       {side.artifacts.length === 0 ? (
         <p {...stylex.props(styles.text)}>No artifacts available.</p>
       ) : (
@@ -394,18 +398,23 @@ export function ChangedRegions({
   visual,
   before,
   after,
+  id,
+  level = 2,
 }: {
   visual: Extract<Visual, { kind: 'changed' }>;
   before: string;
   after: string;
+  id: string;
+  level?: 2 | 3;
 }) {
   const resolve = use(EvidenceUrls);
+  const Heading = level === 2 ? 'h2' : 'h3';
 
   return (
-    <section {...stylex.props(styles.stack)} aria-labelledby="changed-regions">
-      <h2 id="changed-regions" {...stylex.props(styles.heading)}>
+    <section {...stylex.props(styles.stack)} aria-labelledby={id}>
+      <Heading id={id} {...stylex.props(styles.heading)}>
         Changed regions
-      </h2>
+      </Heading>
       <ol {...stylex.props(styles.regionList)}>
         {visual.regions.map((region, index) => {
           const crop = cropAround(region, visual);
