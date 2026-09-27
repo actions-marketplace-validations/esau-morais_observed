@@ -56,6 +56,19 @@ export type CollectorContext = {
   readonly steps: StepLog;
 };
 
+// Without a browser: the collector talks to the application directly.
+export type DirectContext = {
+  readonly url: string;
+  // Values of the variables the collector's `environment` names.
+  readonly environment: ReadonlyMap<string, string>;
+};
+
+// Fails the capture as a configuration problem.
+export class EnvironmentValueFailure extends Schema.TaggedError<EnvironmentValueFailure>()(
+  'EnvironmentValueFailure',
+  { message: Schema.String },
+) {}
+
 export type SeparateSessionContext = CollectorContext & {
   readonly runSteps: (
     steps: readonly Step[],
@@ -74,8 +87,19 @@ export type EvidenceConditions = Readonly<
   Record<string, string | number | boolean | null>
 >;
 
+export type EvidenceProducer = {
+  readonly name: string;
+  readonly version: string;
+};
+
 type Common<K extends EvidenceKind> = {
   readonly conditions?: (config: CollectorConfig<K>) => EvidenceConditions;
+  // Recorded as the evidence producer instead of agent-browser.
+  readonly producer?: EvidenceProducer;
+  // Environment variables the collector reads. Observed resolves them before
+  // setup, fails the capture when one is missing or empty, and conceals their
+  // values in all evidence as it does fill values.
+  readonly environment?: (config: CollectorConfig<K>) => readonly string[];
 };
 
 export type Collector<K extends EvidenceKind> =
@@ -97,4 +121,10 @@ export type Collector<K extends EvidenceKind> =
       readonly phase: 'separate-session';
       readonly launchArguments?: readonly string[];
       readonly collect: Collect<K, SeparateSessionContext>;
+    })
+  // Runs at the same point as a separate session, in list order with those
+  // collectors, but opens no browser.
+  | (Common<K> & {
+      readonly phase: 'no-browser';
+      readonly collect: Collect<K, DirectContext>;
     });

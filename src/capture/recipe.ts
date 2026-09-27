@@ -86,11 +86,22 @@ export const recipeSchema = Schema.Struct({
           issues.push(`Check ${check.id} needs a ${kind} collector`);
         }
       }
+
+      issues.push(...checkIssues(check, recipe.collectors));
     }
 
     return issues;
   }),
 );
+
+function checkIssues<K extends CheckDefinition['kind']>(
+  check: Extract<CheckDefinition, { kind: K }>,
+  collectors: readonly CollectorConfig[],
+): readonly string[] {
+  const entry: CheckKinds[K] = checkKinds[check.kind];
+
+  return entry.validate?.(check, collectors) ?? [];
+}
 
 // Adds the collectors checks need, unless the journey already lists that kind.
 export function journeyCollectors(
