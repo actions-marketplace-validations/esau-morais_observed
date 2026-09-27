@@ -1,0 +1,139 @@
+{
+  "schemaVersion": 1,
+  "name": "Observed report viewer",
+  "source": {
+    "entry": "src/workflow-cli.ts",
+    "paths": [
+      "package.json",
+      "bun.lock",
+      "bunfig.toml",
+      "tsconfig.json",
+      "vite.config.ts",
+      "scripts",
+      "src",
+      "viewer",
+      "tests/fixtures/self-observe"
+    ]
+  },
+  "setup": [
+    ["bun", "install", "--frozen-lockfile"],
+    ["bun", "run", "build"],
+    [
+      "tar",
+      "-xzf",
+      "tests/fixtures/self-observe/captures.tar.gz",
+      "-C",
+      "tests/fixtures/self-observe"
+    ],
+    [
+      "sh",
+      "-c",
+      "bun dist/observed.js compare tests/fixtures/self-observe/base tests/fixtures/self-observe/candidate --output self-observe --json > self-observe.json; code=$?; [ $code -eq 2 ] || { cat self-observe.json; echo \"compare exited $code; the fixture must read as a regression (2)\" >&2; exit 1; }"
+    ]
+  ],
+  "start": [
+    "bun",
+    "dist/observed.js",
+    "view",
+    "self-observe",
+    "--port",
+    "{port}"
+  ],
+  "ready": { "path": "/", "status": 200 },
+  "journeys": [
+    {
+      "name": "Open the regression report",
+      "path": "/",
+      "ready": [{ "kind": "wait-selector", "selector": "#report-title" }],
+      "steps": [
+        { "kind": "navigate", "path": "/" },
+        { "kind": "wait-selector", "selector": "#report-title" }
+      ],
+      "checks": [
+        {
+          "kind": "text",
+          "id": "regression-headline",
+          "name": "Regression headline",
+          "scope": "The verdict word above the title after the report loads, including its \"!\" symbol.",
+          "selector": "section[aria-labelledby=\"report-title\"] > p:first-child",
+          "expectedText": "!\nRegression"
+        },
+        {
+          "kind": "browser-errors",
+          "id": "no-browser-errors",
+          "name": "No browser errors",
+          "scope": "Loading the report page until its title renders."
+        },
+        {
+          "kind": "accessibility",
+          "id": "no-new-serious-violations",
+          "name": "No new serious accessibility violations",
+          "scope": "The report page after it loads.",
+          "impact": "serious"
+        },
+        {
+          "kind": "performance",
+          "id": "report-load",
+          "name": "Report loads quickly",
+          "scope": "Loading the report page until its title renders.",
+          "metric": "load",
+          "max": 250
+        }
+      ],
+      "browserArguments": ["--no-sandbox"],
+      "viewport": { "width": 1280, "height": 800, "scale": 1 }
+    },
+    {
+      "name": "Find the duplicate request",
+      "path": "/",
+      "ready": [{ "kind": "wait-selector", "selector": "#report-title" }],
+      "steps": [
+        {
+          "kind": "click",
+          "selector": ":not(details) > nav[aria-label=\"Report sections\"] a[href=\"#evidence-timeline\"]"
+        },
+        {
+          "kind": "wait-selector",
+          "selector": "section[aria-label=\"After steps\"]"
+        }
+      ],
+      "checks": [
+        {
+          "kind": "text",
+          "id": "duplicate-get-listed",
+          "name": "Duplicate GET listed on its step",
+          "scope": "The candidate's first step in the Steps section, opened from the section index.",
+          "selector": "section[aria-label=\"After steps\"] ol > li:first-child ul",
+          "expectedText": "GET /api/items · 200\nGET /api/items · 200"
+        }
+      ],
+      "browserArguments": ["--no-sandbox"],
+      "viewport": { "width": 1280, "height": 800, "scale": 1 }
+    },
+    {
+      "name": "Open a disclosure with the keyboard",
+      "path": "/",
+      "ready": [{ "kind": "wait-selector", "selector": "#report-title" }],
+      "steps": [
+        { "kind": "press", "key": "Tab" },
+        { "kind": "press", "key": "Enter" },
+        { "kind": "press", "key": "Tab" },
+        { "kind": "press", "key": "Tab" },
+        { "kind": "press", "key": "Tab" },
+        { "kind": "press", "key": "Enter" }
+      ],
+      "checks": [
+        {
+          "kind": "text",
+          "id": "focused-disclosure-open",
+          "name": "Enter opens the focused disclosure",
+          "scope": "Skip link, then Tab to the agent-text preview and press Enter.",
+          "selector": "details[open] > summary:focus",
+          "expectedText": "Preview the agent text"
+        }
+      ],
+      "browserArguments": ["--no-sandbox"],
+      "viewport": { "width": 1280, "height": 800, "scale": 1 }
+    }
+  ]
+}
