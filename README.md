@@ -9,55 +9,54 @@ open the result.
 
 Everything runs locally. No model or account is required to capture or view it.
 
-## Try it
+## Install
 
-With Bun **1.4.2** installed, run from the checkout:
+Observed runs on Linux x64 and macOS, Intel or Apple silicon, with
+[Bun](https://bun.sh/docs/installation) 1.4.2 or later. Windows and Linux on
+arm64 are not supported: Chrome for Testing, which Observed captures with,
+publishes no Linux arm64 build.
 
 ```bash
-bun start
+bun add --global @observed-software/cli
+observed setup
 ```
 
-This installs dependencies and the browser, captures the Request lab example,
-and starts the viewer. Open the printed localhost URL. Press Ctrl+C to stop.
+Bun reports one blocked postinstall. It belongs to agent-browser, which already
+ships its binaries, so leave it blocked. `observed setup` downloads the Chrome
+build Observed captures with, about 190 MB. On a Linux machine without desktop
+libraries, such as a container, run `observed setup --with-deps` instead; it
+also installs system packages with `sudo apt`.
 
-Observed creates the evidence files. You don't write a manifest or collect
-screenshots by hand.
+To use a pinned version without installing it, start each command with
+`bunx @observed-software/cli@<version>` instead of `observed`, as in
+`bunx @observed-software/cli@0.1.0 setup`.
 
 ## Use it on your app
 
-Observed runs on Linux and macOS. Windows is not supported.
-
-Observed runs from its own checkout. With Bun **1.4.2** installed:
-
-```bash
-git clone https://github.com/esau-morais/observed
-cd observed
-bun install --frozen-lockfile
-bun run setup
-```
-
-`bun run setup` downloads Chrome. On a Linux machine without desktop libraries,
-such as a container, run `bun run setup --with-deps` instead; it installs the
-system packages with `sudo apt`.
-
 Ask your coding agent to write `observed.json` in your app's directory by
-following [Write observed.json](#write-observedjson). Then, from the Observed
-checkout:
+following [Write observed.json](#write-observedjson). Then, from that directory:
 
 ```bash
-bun run observe /path/to/app --json              # preview the working tree
-bun run observe /path/to/app --base HEAD --json  # compare it with a commit
+observed observe --json              # preview the working tree
+observed observe --base HEAD --json  # compare it with a commit
 ```
+
+Pass the app's directory as an argument to run from elsewhere, as in
+`observed observe path/to/app --json`.
 
 Without `--json`, `observe` opens the viewer and runs until you press Ctrl+C.
-Evidence goes to `evidence/` in the Observed checkout. The JSON output's
-`directory` is the report, and `bun run view <directory>` opens it again. Exit
-codes: `0` completed, `1` unavailable, `2` a named check failed. When Observed
-rejects `observed.json`, it prints no JSON and explains why on stderr.
+Evidence goes to `.observed/` in the app's directory, which holds its own
+`.gitignore`, so Git ignores it without changes to your repository. The JSON
+output's `directory` is the report, and `observed view <directory>` opens it
+again. `observed view path/to/app` opens the app's latest run, and
+`observed view` with no argument opens the current directory's latest run.
+With `--output`, Observed writes only to that directory. Exit codes: `0` completed, `1` unavailable, `2` a
+named check failed or regressed. When Observed rejects `observed.json`, it prints no JSON
+and explains why on stderr.
 
 Each capture, from setup through the journey, must finish within `--timeout`
 milliseconds, 120000 by default. Raise it when installing and building the app
-takes longer.
+takes longer. `observed <command> --help` lists every option.
 
 ### Write observed.json
 
@@ -153,15 +152,30 @@ such as password inputs.
 `view` opens a saved bundle as it was evaluated at export. It still rejects
 evidence whose bytes changed afterward.
 
-The version 1 importer accepts generated evidence bundles through
-`bun run report <manifest.json> <new-report.md>`. The output parent must exist and
-the output file must be new. Behavior claims remain labeled imported; missing
+From a checkout of this repository, the version 1 importer accepts generated
+evidence bundles through `bun run report <manifest.json> <new-report.md>`. The
+output parent must exist and the output file must be new. Behavior claims remain labeled imported; missing
 evidence is unknown. Exit success means written, not behavior verified.
 
 See the [schema](src/schema.ts), [example manifest](tests/fixtures/todomvc/manifest.json),
 and [TodoMVC provenance](tests/fixtures/todomvc/README.md). Keep input bundles immutable.
 
 </details>
+
+## Develop Observed
+
+With Bun **1.4.2**, run the Request lab example from a checkout:
+
+```bash
+git clone https://github.com/esau-morais/observed
+cd observed
+bun start
+```
+
+This installs dependencies and the browser, captures the example, and starts
+the viewer. Open the printed localhost URL. Press Ctrl+C to stop. In a checkout,
+`bun run observe`, `bun run setup` and `bun run view` run the CLI from source,
+as in `bun run observe examples/shop` followed by `bun run view examples/shop`.
 
 Development checks:
 
@@ -171,8 +185,28 @@ bun run check
 
 `bun run test` runs the Vitest unit tests. `bun run verify` exercises capture and
 the viewer against both example projects. Plain `bun test` stops with a pointer to
-these scripts.
-Reports and captures stay local under gitignored `evidence/`.
+these scripts. `bun run build` writes the published CLI and viewer to `dist/`.
+Test reports stay local under gitignored `evidence/`.
+
+To release, set the new `version` in `package.json`, add a `CHANGELOG.md`
+entry headed `## <version> (<date>)`, merge, and push the tag `v<version>`.
+[.github/workflows/release.yml](.github/workflows/release.yml) installs the
+packed CLI on Linux x64 and macOS on Intel and Apple silicon, and runs the Request lab example
+through it. It then publishes that tarball to npm with provenance, creates the
+GitHub release, and moves the major tag, such as `v0`, to the release commit.
+The tagged commit must be on `main`.
+
+npm can only trust a workflow for a package that already exists, so the first
+release needs a token once:
+
+1. Create a granular npm access token that can publish to the
+   `@observed-software` organization, with a short expiry. Store it as the
+   `NPM_TOKEN` secret of the `npm` environment in this repository.
+2. Push the tag and let the release workflow publish.
+3. On npmjs.com, open the package's settings, add this repository's
+   `release.yml` workflow and the `npm` environment as a trusted publisher,
+   and select "Require two-factor authentication and disallow tokens".
+4. Delete the npm token and the `NPM_TOKEN` secret.
 
 ## Run on pull requests
 
@@ -209,8 +243,9 @@ jobs:
           base: ${{ github.event.pull_request.base.sha }}
 ```
 
-- Replace `OBSERVED_COMMIT_SHA` with a full commit SHA from this repository that
-  contains `action.yml`.
+- Replace `OBSERVED_COMMIT_SHA` with the full commit SHA of a
+  [release](https://github.com/esau-morais/observed/releases) tag. The action
+  installs the Observed CLI with that release's version.
 - Set `project` to the directory holding `observed.json`, relative to the
   repository root.
 - `base` is the base commit recorded in the pull request event. It stays fixed
@@ -240,7 +275,7 @@ writes no readable result, or when the result disagrees with the exit code.
 
 The job summary states the conclusion, each side's revision, capture state, and
 check outcome, and why a capture failed. Its **Open the report** link opens
-`observed-bundle.html` in the browser: the same report as `bun run view`, with
+`observed-bundle.html` in the browser: the same report as `observed view`, with
 the screenshots, changed regions, checks, requests and original artifacts in
 one file. GitHub shows it only to signed-in users who can read the repository;
 a signed-out visitor gets a 404, even on a public repository. GitHub serves it
@@ -250,8 +285,8 @@ summary link rather than the address the page opens at.
 Whenever the capture step ran, including failed comparisons, the action also
 uploads the `observed-bundle` artifact. It holds the raw captures,
 `result.json`, and the exported viewer. To open it with a
-local server, download it and run `bun run view <download>/run/report` from an
-Observed checkout. GitHub keeps both artifacts for 7 days by default.
+local server, download it and run `observed view <download>/run/report`.
+GitHub keeps both artifacts for 7 days by default.
 
 Optional inputs: `candidate` (default `HEAD`), `timeout` per capture in
 milliseconds (default `120000`), `artifact-name`, and `retention-days`. The
