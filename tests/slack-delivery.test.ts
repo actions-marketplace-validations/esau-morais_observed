@@ -1,21 +1,27 @@
 import { Effect } from 'effect';
-import { expect, test } from 'vitest';
+import { afterEach, expect, test, vi } from 'vitest';
 import {
+  diffCrop,
   readSlackState,
   slackAction,
   slackMessage,
+  uploadSlackImage,
   writeSlackState,
 } from '../scripts/slack-delivery';
+import { decodePng, encodeRgbPng } from '../src/png';
 import { slackSkipReason } from '../scripts/github-action';
 import { compareCaptures, inspectSide } from '../src/comparison';
 
 const evaluatedAt = '2026-09-26T12:00:00.000Z';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 const links = {
   name: 'Observed',
   pullRequest: 'https://github.com/o/r/pull/7',
   pullRequestLabel: 'o/r#7',
   report: 'https://github.com/o/r/actions/runs/1/artifacts/2',
-  check: null,
   run: 'https://github.com/o/r/actions/runs/1',
 };
 
@@ -32,16 +38,21 @@ async function unavailable() {
   });
 }
 
-test('Slack notifies when a pull request starts failing and edits quietly otherwise', () => {
+test('Slack notifies when a pull request starts failing or recovers, and edits quietly otherwise', () => {
   const failing = { channel: 'C1', ts: '1.1', failing: true };
   const passing = { ...failing, failing: false };
+  const fails = { failing: true, passed: false };
+  const passes = { failing: false, passed: true };
+  const neutral = { failing: false, passed: false };
 
-  expect(slackAction(null, 'C1', true)).toBe('post');
-  expect(slackAction(null, 'C1', false)).toBe('none');
-  expect(slackAction(failing, 'C1', true)).toBe('update');
-  expect(slackAction(failing, 'C1', false)).toBe('update');
-  expect(slackAction(passing, 'C1', true)).toBe('post');
-  expect(slackAction(failing, 'C2', true)).toBe('post');
+  expect(slackAction(null, 'C1', fails)).toBe('post');
+  expect(slackAction(null, 'C1', passes)).toBe('none');
+  expect(slackAction(failing, 'C1', fails)).toBe('update');
+  expect(slackAction(failing, 'C1', passes)).toBe('recover');
+  expect(slackAction(failing, 'C1', neutral)).toBe('update');
+  expect(slackAction(passing, 'C1', passes)).toBe('update');
+  expect(slackAction(passing, 'C1', fails)).toBe('post');
+  expect(slackAction(failing, 'C2', fails)).toBe('post');
 });
 
 test('an unavailable or unreadable result never gets a passing icon in Slack', async () => {
@@ -89,11 +100,10 @@ test('captured names cannot mention anyone in Slack, and captured values stay ou
   );
 
   expect(message).not.toMatch(/<!channel>|<@U123>/);
-  expect(message).toContain('&lt;!channel&gt;');
-  expect(message).toContain('1 of 2 checks passed');
   expect(message).toContain(
-    'Unknown · Order total &lt;!channel&gt; &lt;@U123&gt;. Scope: One checkout',
+    'Unavailable: Order total &lt;!channel&gt; &lt;@U123&gt;',
   );
+  expect(message).toContain('1 of 2 checks unknown');
   expect(message).not.toContain('Captured page text');
   expect(message).not.toContain('Captured item text');
 });
@@ -124,4 +134,131 @@ test('Slack is skipped with a reason instead of posting duplicates or to a guess
   expect(reason({ channel: '#observed-test' })).toContain('channel ID');
   expect(reason({ pullRequest: null })).toContain('only for pull requests');
   expect(reason({ lookupFailed: true })).toContain('could not be looked up');
+});
+
+test('a failing Slack message leads with the values and the source location, without captured text', async () => {
+  const result = await unavailable();
+  const [journey] = result.journeys;
+  const check = {
+    scope: 'One Reading click',
+    expectation: 'No uncaught page errors.',
+  };
+  const message = slackMessage(
+    {
+      ...result,
+      journeys: [
+        {
+          ...journey,
+          checks: [
+            {
+              ...check,
+              id: 'errors',
+              name: 'No browser errors',
+              verdict: 'regression',
+              detail: 'TypeError: Captured page text',
+              measure: {
+                label: 'Browser errors',
+                base: '0',
+                candidate: '1',
+                limit: 'none allowed',
+              },
+            },
+            {
+              ...check,
+              id: 'books',
+              name: 'One books request',
+              verdict: 'passed',
+              detail: 'Captured item text',
+            },
+          ],
+          findings: [
+            {
+              id: 'error-1',
+              evidence: 'browser-errors',
+              checks: ['errors'],
+              subject: 'TypeError',
+              comparison: 'new',
+              location: {
+                kind: 'anchored',
+                anchors: [
+                  {
+                    path: 'src/App.jsx',
+                    line: 10,
+                    side: 'candidate',
+                    basis: 'stack-frame',
+                    evidence: 'Captured frame text',
+                    artifacts: [],
+                    diff: 'added',
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+      summary: { passed: 1, total: 2 },
+      conclusion: { kind: 'regression', text: 'Captured page text' },
+    },
+    links,
+  );
+  const text = JSON.stringify(message);
+
+  expect(message.blocks[0]).toMatchObject({
+    text: {
+      text: ':red_circle: *Regression: Browser errors 0 → 1, none allowed* · thrown at `src/App.jsx:10` · <https://github.com/o/r/pull/7|o/r#7>',
+    },
+  });
+  expect(text).toContain('1 of 2 checks failed');
+  expect(message.blocks[2]).toMatchObject({
+    type: 'actions',
+    elements: [
+      { text: { text: 'Open report' }, url: links.report },
+      { text: { text: 'View on PR' }, url: links.pullRequest },
+    ],
+  });
+  expect(text).not.toContain('Captured');
+});
+
+test('the Slack image is one changed region with a margin, clamped to the screenshot', () => {
+  const width = 100;
+  const rgb = new Uint8Array(width * width * 3).map((_, index) => index % 251);
+  const crop = diffCrop(encodeRgbPng(width, width, rgb), {
+    x: 90,
+    y: 5,
+    width: 10,
+    height: 10,
+    changedPixels: 100,
+  });
+  const decoded = crop === null ? null : decodePng(crop);
+
+  if (decoded?.kind !== 'decoded') {
+    throw new Error('The crop is not a readable PNG');
+  }
+
+  expect([decoded.image.width, decoded.image.height]).toEqual([26, 31]);
+  expect(Array.from(decoded.image.rgba.subarray(0, 3))).toEqual(
+    Array.from(rgb.subarray(74 * 3, 74 * 3 + 3)),
+  );
+});
+
+// Slack answers a token without the scope with ok: false and missing_scope,
+// per https://docs.slack.dev/reference/methods/files.getUploadURLExternal
+test('without files:write the image is skipped and nothing else is sent', async () => {
+  const fetch = vi.fn(() =>
+    Promise.resolve(Response.json({ ok: false, error: 'missing_scope' })),
+  );
+
+  vi.stubGlobal('fetch', fetch);
+
+  await expect(
+    uploadSlackImage('xoxb-test', {
+      channel: 'C1',
+      threadTs: '1.1',
+      filename: 'observed-changed-pixels.png',
+      title: 'Changed pixels',
+      altText: 'Changed pixels',
+      bytes: new Uint8Array([1]),
+    }),
+  ).resolves.toBe('missing-scope');
+  expect(fetch).toHaveBeenCalledTimes(1);
 });
