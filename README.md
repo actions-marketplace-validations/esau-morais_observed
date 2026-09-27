@@ -109,13 +109,30 @@ The [project schema](src/project.ts) and
 - A journey's optional `collectors` list records more evidence after `steps`,
   with or without a check reading it. Checks add the collectors they need. The
   [evidence kinds](src/evidence-kinds/index.ts) list what can be collected.
-- A check is `request-count` or `text`. A
+- A check is `request-count`, `text` or `react-renders`. A
   `request-count` check counts the requests during `steps` whose method, path
   and status match. It counts requests to the app's origin, or to the check's
   `origin` when set. It compares the path without the query string or
   fragment, so `/api/items` counts both `/api/items` and `/api/items?page=2`,
   and the check's `path` can't contain `?` or `#`. A `text` check passes when exactly one element
   matches its selector and its text equals `expectedText`.
+- A `react-renders` check fails when the component named in `component` renders
+  more than `maxRenders` times during `steps`. It adds the `{ "kind": "react" }`
+  collector, which you can also list in `collectors` without a check. After the
+  journey, the collector opens the app in a second browser with React DevTools
+  enabled, runs `ready` and `steps` again and counts each render that commits
+  work. Observed doesn't count renders React discards after bailing out, and it
+  sums components that share a name. Counting stops once React has committed
+  nothing for half a second after the last step; a page that keeps committing
+  for 5 seconds leaves the evidence unavailable. Nothing from this second
+  browser reaches request checks. A failed check counts as a regression only
+  when both versions ran the same React version and build.
+- Production builds usually minify component names, so a `react-renders` check
+  can name a component only when the build keeps names. Vite 8 keeps them with
+  `build: { rolldownOptions: { output: { keepNames: true } } }`, and Vite 7
+  with `esbuild: { keepNames: true }`. The check reports unknown when no mounted
+  component has that name, when the recording reached its component limit, and
+  when the page has no React root or loads a new document during `steps`.
 - Put the expected result in the check, not in a step. A step that waits for the
   expected text times out when the app regresses, and the run reports
   unavailable instead of a failed check. Wait for something both versions show,
