@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from 'node:util';
 import {
   comparisonSchema,
   conclusionExitCodes,
+  type CheckVerdict,
   type Comparison,
   type Journey,
   type Side,
@@ -128,17 +129,69 @@ export function journeySides(
       ];
 }
 
+// GitHub limits a comment or check run summary to 65,536 characters, and an
+// imported test suite can have hundreds of checks. The report lists them all.
+const listedChecks = 50;
+
+const severity = [
+  'regression',
+  'failed',
+  'unknown',
+  'not-run',
+  'passed',
+] as const satisfies readonly CheckVerdict['verdict'][];
+
 export function checkList(result: Comparison): string {
-  const lines = result.journeys.flatMap((journey) =>
-    journey.checks.map((check) => {
-      const where =
-        result.journeys.length === 1 ? '' : `${inlineText(journey.title)}: `;
+  const entries = result.journeys.flatMap((journey) => {
+    const where =
+      result.journeys.length === 1 ? '' : `${inlineText(journey.title)}: `;
+    const imported = new Set(
+      journey.candidate.checks
+        .filter((check) => check.authority !== 'Executed by Observed')
+        .map((check) => check.id),
+    );
+    const folded = (check: CheckVerdict) =>
+      check.verdict === 'passed' && imported.has(check.id);
+    const passedImported = journey.checks.filter(folded).length;
 
-      return `- **${verdictLabels[check.verdict]}** · ${where}${inlineText(check.name)}. Scope: ${inlineText(check.scope)}${check.verdict === 'passed' ? '' : ` ${inlineText(check.detail)}`}`;
-    }),
+    return [
+      ...journey.checks
+        .filter((check) => !folded(check))
+        .map((check) => ({
+          verdict: check.verdict,
+          count: 1,
+          text: `- **${verdictLabels[check.verdict]}** · ${where}${inlineText(check.name)}. Scope: ${inlineText(check.scope)}${check.verdict === 'passed' ? '' : ` ${inlineText(check.detail)}`}`,
+        })),
+      ...(passedImported === 0
+        ? []
+        : [
+            {
+              verdict: 'passed' as const,
+              count: passedImported,
+              text: `- **${verdictLabels.passed}** · ${where}${passedImported} imported ${passedImported === 1 ? 'test' : 'tests'}, listed in the report.`,
+            },
+          ]),
+    ];
+  });
+  const ordered = severity.flatMap((verdict) =>
+    entries.filter((entry) => entry.verdict === verdict),
   );
+  const hidden = ordered.slice(listedChecks);
+  const more = severity.flatMap((verdict) => {
+    const count = hidden
+      .filter((entry) => entry.verdict === verdict)
+      .reduce((sum, entry) => sum + entry.count, 0);
 
-  return [`**${checkSummary(result)}.**`, ...lines].join('\n');
+    return count === 0
+      ? []
+      : [`${count} ${verdictLabels[verdict].toLowerCase()}`];
+  });
+
+  return [
+    `**${checkSummary(result)}.**`,
+    ...ordered.slice(0, listedChecks).map((entry) => entry.text),
+    ...(more.length === 0 ? [] : [`- More in the report: ${more.join(', ')}.`]),
+  ].join('\n');
 }
 
 export function describeFailure(
