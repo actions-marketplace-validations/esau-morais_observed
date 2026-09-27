@@ -412,6 +412,7 @@ export async function uploadSlackImage(
   try {
     stored = await fetch(upload.upload_url, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
       body: new Blob([Buffer.from(image.bytes)]),
       signal: AbortSignal.timeout(30_000),
     });
@@ -423,7 +424,9 @@ export async function uploadSlackImage(
     });
   }
 
-  if (!stored.ok) {
+  // The upload URL answers 200 on success; the reference treats anything
+  // else as a failure.
+  if (stored.status !== 200) {
     throw new SlackError({
       message: `the file upload answered HTTP ${String(stored.status)}`,
       code: 'upload_failed',
