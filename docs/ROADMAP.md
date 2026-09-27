@@ -21,6 +21,18 @@ therefore no longer a Phase 3 option. [PRODUCT.md](PRODUCT.md#github-slack-and-u
 and [ARCHITECTURE.md](ARCHITECTURE.md#reuse-and-adapters) own the delivery rules;
 remote actions still wait for authorization and run identity work.
 
+Decision, 2026-09-27: the maintainer set delivery to present Observed as a
+proof-check, with source locations and an evidence handoff to the user's own
+agent. [PRODUCT.md](PRODUCT.md#github-slack-and-unattended-use) and
+[ARCHITECTURE.md](ARCHITECTURE.md#source-anchors) own the rules. The delivery
+refresh is five changes:
+
+- Source anchors: source-map resolution, diff name matching, and anchor fields in the result.
+- Summary and Slack: the brief GitHub summary, job outcome, and Slack message.
+- Report: open on failing evidence, section index, provenance drawer, dark theme, and agent copy.
+- Line delivery, after source anchors and the summary: check-run annotations and review comments.
+- Posting modes, after the summary: the `comment` input and the `/observed` workflow.
+
 Read only the document relevant to the task:
 
 | Task | Document |
@@ -41,7 +53,7 @@ Advance when the exit condition holds.
 | 1. See a real project | One command opens a captured page or a version comparison. Two separate applications, including non-React, use the same runner without core edits. Optional checks distinguish failed expectations from visual changes; missing requested captures stay visible |
 | 2. Repeatable use | Executed recipes, isolated runs, one existing hook or CI trigger, export. Fresh-checkout runs need no recurring setup help; stale or failed captures never pass |
 | 3. One extension | Choose an existing-test importer, deeper performance, or an API operation from pilot demand. It saves work and preserves the report contract |
-| 4. Bounded repair | Agent handoff, isolated patches, protected checks, budgets, independent reruns. Repair stops correctly and improves on manual handoff |
+| 4. Bounded repair | Patch agent driven by the evidence handoff, isolated patches, protected checks, budgets, independent reruns. Repair stops correctly and improves on handing the evidence to the user's agent |
 | Later | Database, jobs, traces, additional frameworks, and optional proof adapters, each tied to a recurring workflow |
 
 ## First implementation sequence
