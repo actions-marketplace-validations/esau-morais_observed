@@ -24,6 +24,7 @@ import {
   agentLaunch,
   agents,
   agentTitles,
+  cliCommand,
   detectAgents,
   githubRepository,
   openCodeMajor,
@@ -31,6 +32,7 @@ import {
   requiredCheckStep,
   defaultBranch,
   setupPrompt,
+  shellPath,
   skillText,
   workflowStep,
   type Agent,
@@ -474,8 +476,10 @@ const skill = Command.make(
     const readme = yield* fs
       .readFileString(path.join(toolRoot, 'README.md'))
       .pipe(Effect.orElseSucceed(() => ''));
+    const version = yield* observedVersion(toolRoot);
     const text = skillText({
-      version: yield* observedVersion(toolRoot),
+      cli: yield* installedCli(version),
+      version,
       guide: guideSection(readme),
     });
 
@@ -560,6 +564,55 @@ const openInBrowser = (url: string) =>
       stdio: ['ignore', 'ignore', 'ignore'],
     }).unref(),
   ).pipe(Effect.ignore);
+
+// Another program named observed must not hold up setup, even when a child it
+// started keeps the output open, so the read stops at the deadline too.
+const installedCli = (version: string) =>
+  Effect.promise(async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      const child = Bun.spawn(['observed', '--version'], {
+        cwd: homedir(),
+        env: { ...process.env, PATH: shellPath(process.env.PATH ?? '') },
+        stdin: 'ignore',
+        stdout: 'pipe',
+        stderr: 'ignore',
+        timeout: 3000,
+      });
+      const reader = child.stdout.getReader();
+      const read = async () => {
+        const decoder = new TextDecoder();
+        let text = '';
+
+        for (;;) {
+          const chunk = await reader.read();
+
+          if (chunk.done) {
+            return text;
+          }
+
+          text += decoder.decode(chunk.value, { stream: true });
+        }
+      };
+
+      const output = await Promise.race([
+        read(),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => {
+            reader.cancel().catch(() => undefined);
+            resolve(null);
+          }, 3000);
+        }),
+      ]);
+
+      return cliCommand(version, (await child.exited) === 0 ? output : null);
+    } catch {
+      return cliCommand(version, null);
+    } finally {
+      clearTimeout(timer);
+    }
+  });
 
 const isExecutable = (file: string) => {
   try {
@@ -822,7 +875,8 @@ const guided = Effect.fn('guidedSetup')(function* (options: {
     const detected = sameOpenCode
       ? found.filter((agent) => agent !== 'opencode2')
       : found;
-    const prompt = setupPrompt(version, missing ? 'missing' : 'invalid');
+    const cli = yield* installedCli(version);
+    const prompt = setupPrompt(cli, missing ? 'missing' : 'invalid');
     const plan = () => {
       const chosen = Option.getOrNull(options.agent);
 
@@ -1006,7 +1060,7 @@ const guided = Effect.fn('guidedSetup')(function* (options: {
             step: 'config',
             instruction:
               'Give this prompt to your coding agent, then run observed again.',
-            prompt: setupPrompt(version, written ? 'invalid' : 'missing'),
+            prompt: setupPrompt(cli, written ? 'invalid' : 'missing'),
           },
           null,
           setupNeeded,
@@ -1047,7 +1101,7 @@ const guided = Effect.fn('guidedSetup')(function* (options: {
               step: 'capture',
               instruction:
                 'Give this prompt to your coding agent, then run observed again.',
-              prompt: setupPrompt(version, 'unavailable'),
+              prompt: setupPrompt(yield* installedCli(version), 'unavailable'),
             }
           : null,
         run,

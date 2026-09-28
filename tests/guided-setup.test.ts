@@ -16,6 +16,7 @@ import {
   agentLaunch,
   agents,
   checkoutAction,
+  cliCommand,
   detectAgents,
   githubRepository,
   openCodeMajor,
@@ -24,6 +25,7 @@ import {
   pushFailure,
   requiredCheckStep,
   setupTitle,
+  shellPath,
   workflowStep,
   workflowYaml,
   type Answer,
@@ -111,6 +113,7 @@ test.each([
 
 test('every command in the skill runs the exact version that printed it', () => {
   const text = skillText({
+    cli: cliCommand('0.3.0-alpha.2', null),
     version: '0.3.0-alpha.2',
     guide:
       '### Write observed.json\n\nThen `observed\n  capture` takes the first journey.',
@@ -127,6 +130,33 @@ test('every command in the skill runs the exact version that printed it', () => 
   ).toBe(true);
   expect(text).not.toMatch(/`observed\s/);
   expect(text).toContain('blob/v0.3.0-alpha.2/README.md');
+});
+
+test.each([
+  { installed: 'observed v0.3.0-alpha.2\n', cli: 'observed' },
+  {
+    installed: 'observed v0.3.0-alpha.1\n',
+    cli: 'bunx @observed-software/cli@0.3.0-alpha.2',
+  },
+  { installed: null, cli: 'bunx @observed-software/cli@0.3.0-alpha.2' },
+])(
+  'the prompt names observed only when it is installed at the running version: $installed',
+  ({ installed, cli }) => {
+    expect(cliCommand('0.3.0-alpha.2', installed)).toBe(cli);
+  },
+);
+
+test('the installed-command check ignores the node_modules/.bin that bunx adds to PATH', () => {
+  expect(
+    shellPath(
+      [
+        '/tmp/bunx-1000-@observed-software/cli@0.3.0/node_modules/.bin',
+        '/home/me/app/node_modules/.bin',
+        '/home/me/.bun/bin',
+        '/usr/bin',
+      ].join(path.delimiter),
+    ),
+  ).toBe(['/home/me/.bun/bin', '/usr/bin'].join(path.delimiter));
 });
 
 test('the generated workflow pins a full commit SHA and grants exactly three permissions', () => {
