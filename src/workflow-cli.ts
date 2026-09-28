@@ -29,6 +29,7 @@ import {
   openCodeMajor,
   guideSection,
   requiredCheckStep,
+  defaultBranch,
   setupPrompt,
   skillText,
   workflowStep,
@@ -493,11 +494,15 @@ const schema = Command.make('schema', {}, () =>
 // Exit code when bare observed stops at a setup step it cannot take alone.
 const setupNeeded = 3;
 
+// The shell's exit code for a command that is not installed.
+const notFound = 127;
+
 const bunShell: Shell = (argv, options) =>
   Effect.promise(async () => {
     try {
       const child = Bun.spawn([...argv], {
         cwd: options.cwd,
+        env: { ...process.env, ...options.env },
         stdin:
           options.input === undefined
             ? 'ignore'
@@ -514,7 +519,7 @@ const bunShell: Shell = (argv, options) =>
       return { code, stdout, stderr };
     } catch (error) {
       return {
-        code: 127,
+        code: notFound,
         stdout: '',
         stderr: error instanceof Error ? error.message : String(error),
       };
@@ -545,6 +550,16 @@ const handOver = (argv: readonly string[], cwd: string) =>
       return error instanceof Error ? error.message : String(error);
     }
   });
+
+// Best effort, and never awaited: xdg-open can start a browser that keeps its
+// output open until it quits. The URL is always printed as well, for SSH
+// sessions and machines without a desktop.
+const openInBrowser = (url: string) =>
+  Effect.try(() =>
+    Bun.spawn([process.platform === 'darwin' ? 'open' : 'xdg-open', url], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    }).unref(),
+  ).pipe(Effect.ignore);
 
 const isExecutable = (file: string) => {
   try {
@@ -720,46 +735,47 @@ const guided = Effect.fn('guidedSetup')(function* (options: {
     });
   }
 
-  const gh = yield* bunShell(['gh', 'auth', 'status'], { cwd: projectRoot });
-  const gitRoot = yield* bunShell(['git', 'rev-parse', '--show-toplevel'], {
+  const gh =
+    (yield* bunShell(['gh', 'auth', 'status'], { cwd: projectRoot })).code ===
+    0;
+  const git = yield* bunShell(['git', 'rev-parse', '--show-toplevel'], {
     cwd: projectRoot,
-  }).pipe(
-    Effect.map((result) => (result.code === 0 ? result.stdout.trim() : null)),
-  );
-  const remote =
+  });
+  const gitRoot = git.code === 0 ? git.stdout.trim() : null;
+  const origin =
     gitRoot === null
       ? null
       : yield* bunShell(['git', 'remote', 'get-url', 'origin'], {
           cwd: gitRoot,
-        }).pipe(
-          Effect.map((result) =>
-            result.code === 0 ? githubRepository(result.stdout) : null,
-          ),
-        );
-  const repository = gh.code === 0 ? remote : null;
+        });
+  const repository =
+    origin?.code === 0 ? githubRepository(origin.stdout) : null;
 
-  yield* record(
-    gh.code === 0
-      ? { id: 'gh', status: 'done', detail: 'GitHub CLI signed in' }
-      : {
-          id: 'gh',
-          status: 'skipped',
-          detail:
-            'GitHub steps skipped: install gh and run gh auth login to add the workflow.',
-        },
-  );
-  yield* record(
-    remote === null
-      ? {
-          id: 'remote',
-          status: 'skipped',
-          detail:
-            gitRoot === null
-              ? 'GitHub steps skipped: this directory is not in a Git repository.'
-              : 'GitHub steps skipped: origin is not a GitHub repository.',
-        }
-      : { id: 'remote', status: 'done', detail: `GitHub repository ${remote}` },
-  );
+  if (repository === null) {
+    let reason = 'origin is not a GitHub repository.';
+
+    if (git.code === notFound) {
+      reason = 'Git is not installed.';
+    } else if (gitRoot === null) {
+      reason = 'this directory is not in a Git repository.';
+    } else if (origin?.code !== 0) {
+      reason = 'this repository has no origin remote.';
+    }
+
+    yield* record({
+      id: 'github',
+      status: 'skipped',
+      detail: `GitHub steps skipped: ${reason}`,
+    });
+  } else {
+    yield* record({
+      id: 'github',
+      status: 'done',
+      detail: gh
+        ? `GitHub repository ${repository}, GitHub CLI signed in`
+        : `GitHub repository ${repository}. Without the GitHub CLI, Observed opens the pull request page in your browser.`,
+    });
+  }
 
   const project =
     gitRoot === null
@@ -1050,6 +1066,7 @@ const guided = Effect.fn('guidedSetup')(function* (options: {
   }
 
   let next: Next | null = null;
+  let setupStopped = false;
 
   if (repository !== null && gitRoot !== null) {
     const scratch = yield* fs.makeTempDirectoryScoped({
@@ -1057,6 +1074,7 @@ const guided = Effect.fn('guidedSetup')(function* (options: {
     });
     const workflow = yield* workflowStep({
       shell: bunShell,
+      gh,
       ask,
       say,
       consent,
@@ -1072,39 +1090,40 @@ const guided = Effect.fn('guidedSetup')(function* (options: {
 
     if (workflow.kind === 'waiting') {
       next = { step: 'workflow', instruction: workflow.next };
+      setupStopped = !interactive;
     }
 
-    const base =
-      workflow.kind !== 'ready'
-        ? null
-        : (workflow.base ??
-          (yield* bunShell(
-            [
-              'gh',
-              'repo',
-              'view',
-              repository,
-              '--json',
-              'defaultBranchRef',
-              '--jq',
-              '.defaultBranchRef.name',
-            ],
-            { cwd: gitRoot },
-          ).pipe(
-            Effect.map((result) =>
-              result.code === 0 && result.stdout.trim() !== ''
-                ? result.stdout.trim()
-                : null,
-            ),
-          )));
+    if (workflow.kind === 'pushed') {
+      if (interactive) {
+        yield* openInBrowser(workflow.open);
+        yield* say(
+          `Create the pull request in the browser, or open it there if it already exists. If no browser opened, open ${workflow.open}`,
+        );
+      } else {
+        next = {
+          step: 'workflow',
+          instruction: `Open this page to create the pull request, or to find it if it already exists: ${workflow.open}`,
+        };
+        setupStopped = true;
+      }
+    }
+
+    if (workflow.kind === 'stopped' && workflow.step.status === 'failed') {
+      next = { step: 'workflow', instruction: workflow.step.detail };
+      setupStopped = true;
+    }
+
+    let base: string | null = null;
+
+    if (workflow.kind === 'ready' || workflow.kind === 'pushed') {
+      base = workflow.base ?? (yield* defaultBranch(bunShell, gitRoot));
+    }
 
     if (base !== null) {
       yield* record(
         yield* requiredCheckStep({
           shell: bunShell,
-          ask,
-          say,
-          consent,
+          gh,
           repository,
           base,
           cwd: gitRoot,
@@ -1113,10 +1132,13 @@ const guided = Effect.fn('guidedSetup')(function* (options: {
     }
   }
 
+  const captured = run === null ? 0 : exitCodes[run.result.conclusion.kind];
+
+  // An unfinished setup step outranks a clean capture, not a failed check.
   yield* finish(
     next,
     run,
-    run === null ? 0 : exitCodes[run.result.conclusion.kind],
+    captured === 0 && setupStopped ? setupNeeded : captured,
   );
 
   if (viewer !== null) {
@@ -1135,7 +1157,7 @@ const root = Command.make(
     agent: agentChoiceFlag,
     yes: Flag.Boolean('yes').pipe(
       Flag.withDescription(
-        'Answer yes to the browser download, opening the first agent found, the workflow, Dependabot and the setup pull request. Never creates a ruleset',
+        'Answer yes to the browser download, opening the first agent found, and the setup pull request',
       ),
       Flag.withDefault(false),
     ),

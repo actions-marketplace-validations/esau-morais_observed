@@ -17,9 +17,13 @@ import {
   agents,
   checkoutAction,
   detectAgents,
+  githubRepository,
   openCodeMajor,
   skillText,
+  tagCommit,
+  pushFailure,
   requiredCheckStep,
+  setupTitle,
   workflowStep,
   workflowYaml,
   type Answer,
@@ -182,18 +186,29 @@ test.each([
 
 // Answers GitHub's read-only questions the way a permissive repository would
 // and records every command, so a test can tell reads from outward writes.
-function recordingShell() {
+function recordingShell(
+  overrides: [string, { code: number; stdout: string; stderr: string }][] = [],
+) {
   const commands: string[][] = [];
   const shell: Shell = (argv) => {
     commands.push([...argv]);
     const line = argv.join(' ');
+    const override = overrides.find(([fragment]) => line.includes(fragment));
+
+    if (override !== undefined) {
+      return Effect.succeed(override[1]);
+    }
+
     const answers: [string, string][] = [
-      ['git/ref/tags/', JSON.stringify({ object: { type: 'commit', sha } })],
+      [
+        'refs/tags/v',
+        `${'b'.repeat(40)}\trefs/tags/v0.3.0\n${sha}\trefs/tags/v0.3.0^{}\n`,
+      ],
       [
         'actions/permissions',
         JSON.stringify({ enabled: true, allowed_actions: 'all' }),
       ],
-      ['defaultBranchRef', 'main\n'],
+      ['--symref', `ref: refs/heads/main\tHEAD\n${sha}\tHEAD\n`],
       ['rules/branches', '[]'],
       ['gh pr create', 'https://github.test/o/r/pull/1\n'],
     ];
@@ -213,11 +228,16 @@ function recordingShell() {
   return { shell, commands, outward };
 }
 
-async function offerWorkflow(options: { consent: Consent; answer: Answer }) {
+async function offerWorkflow(options: {
+  consent: Consent;
+  answer: Answer;
+  gh?: boolean;
+  overrides?: Parameters<typeof recordingShell>[0];
+}) {
   const gitRoot = await scratch();
   const observed = path.join(gitRoot, '.observed');
-  const recorded = recordingShell();
-  const questions: string[] = [];
+  const recorded = recordingShell(options.overrides);
+  const questions: { question: string; initial: boolean | undefined }[] = [];
 
   await writeFile(path.join(gitRoot, 'observed.json'), '{}');
 
@@ -226,8 +246,9 @@ async function offerWorkflow(options: { consent: Consent; answer: Answer }) {
       Effect.scoped(
         workflowStep({
           shell: recorded.shell,
-          ask: (question) => {
-            questions.push(question);
+          gh: options.gh ?? true,
+          ask: (question, initial) => {
+            questions.push({ question, initial });
 
             return Effect.succeed(options.answer);
           },
@@ -243,7 +264,10 @@ async function offerWorkflow(options: { consent: Consent; answer: Answer }) {
       ).pipe(Effect.provide(BunServices.layer)),
     );
 
-  return { offer, recorded, questions, observed };
+  // The recording shell creates no worktree, so the files land here.
+  const worktree = path.join(gitRoot, 'observed-setup');
+
+  return { offer, recorded, questions, observed, worktree };
 }
 
 test.each([
@@ -289,8 +313,19 @@ test('a declined workflow is remembered, so observed stops asking', async () => 
   );
 });
 
-test('--yes opens the setup pull request but never creates a ruleset', async () => {
-  const { offer, recorded } = await offerWorkflow({
+test('the setup pull request question defaults to yes', async () => {
+  const { offer, questions } = await offerWorkflow({
+    consent: 'ask',
+    answer: 'cancelled',
+  });
+
+  await offer();
+
+  expect(questions.map((item) => item.initial)).toEqual([true]);
+});
+
+test('--yes pins the peeled release commit and opens the pull request with gh', async () => {
+  const { offer, recorded, worktree } = await offerWorkflow({
     consent: 'yes',
     answer: 'no',
   });
@@ -305,22 +340,174 @@ test('--yes opens the setup pull request but never creates a ruleset', async () 
     'git push --quiet',
     'gh pr create',
   ]);
+  expect(
+    await readFile(
+      path.join(worktree, '.github/workflows/observed.yml'),
+      'utf8',
+    ),
+  ).toContain(`uses: esau-morais/observed@${sha} # v0.3.0`);
+});
 
-  const rules = recordingShell();
-  const step = await Effect.runPromise(
-    requiredCheckStep({
-      shell: rules.shell,
-      ask: () => Effect.succeed('yes' as const),
-      say: () => Effect.void,
+const prefilledPage = (url: string) => {
+  const page = new URL(url);
+
+  expect(page.pathname).toBe('/o/r/compare/main...observed%2Fsetup');
+  expect(page.searchParams.get('quick_pull')).toBe('1');
+  expect(page.searchParams.get('title')).toBe(setupTitle);
+  expect(page.searchParams.get('body')).toContain('#run-on-pull-requests');
+};
+
+test('without gh, --yes pushes with Git and hands over a prefilled pull request page', async () => {
+  const { offer, recorded } = await offerWorkflow({
+    consent: 'yes',
+    answer: 'no',
+    gh: false,
+  });
+  const outcome = await offer();
+
+  expect(recorded.commands.filter((argv) => argv[0] === 'gh')).toEqual([]);
+  expect(recorded.outward().map((argv) => argv.slice(0, 3).join(' '))).toEqual([
+    'git worktree add',
+    'git commit --quiet',
+    'git push --quiet',
+  ]);
+  expect(outcome.kind).toBe('pushed');
+  prefilledPage(outcome.kind === 'pushed' ? outcome.open : '');
+});
+
+test.each([
+  {
+    name: 'the branch is already on origin',
+    overrides: [
+      [
+        'ls-remote --heads',
+        { code: 0, stdout: `${sha}\trefs/heads/observed/setup\n`, stderr: '' },
+      ],
+    ] as Parameters<typeof recordingShell>[0],
+    pushed: false,
+  },
+  {
+    name: 'gh fails after the push',
+    overrides: [
+      [
+        'gh pr create',
+        { code: 1, stdout: '', stderr: 'GraphQL: Resource not accessible\n' },
+      ],
+    ] as Parameters<typeof recordingShell>[0],
+    pushed: true,
+  },
+])(
+  'when $name, observed still hands over the prefilled page',
+  async ({ overrides, pushed }) => {
+    const { offer, recorded } = await offerWorkflow({
       consent: 'yes',
-      repository: 'o/r',
-      base: 'main',
-      cwd: root,
-    }),
-  );
+      answer: 'no',
+      overrides,
+    });
+    const outcome = await offer();
 
-  expect(step.status).toBe('skipped');
-  expect(rules.outward()).toEqual([]);
+    expect(outcome.kind).toBe('pushed');
+    prefilledPage(outcome.kind === 'pushed' ? outcome.open : '');
+    expect(
+      recorded.outward().some((argv) => argv.join(' ').startsWith('git push')),
+    ).toBe(pushed);
+  },
+);
+
+test('an existing Dependabot file on the default branch is never replaced', async () => {
+  const { offer, recorded, worktree } = await offerWorkflow({
+    consent: 'yes',
+    answer: 'no',
+  });
+
+  await mkdir(path.join(worktree, '.github'), { recursive: true });
+  await writeFile(
+    path.join(worktree, '.github/dependabot.yml'),
+    'version: 2\nupdates:\n  - package-ecosystem: npm\n    directory: /\n',
+  );
+  await offer();
+
+  const added = recorded.commands.find(
+    (argv) => argv[0] === 'git' && argv[1] === 'add',
+  );
+  const body = recorded.commands
+    .find((argv) => argv.join(' ').startsWith('gh pr create'))
+    ?.at(-1);
+
+  expect(added).not.toContain('.github/dependabot.yml');
+  expect(body).toContain('package-ecosystem: github-actions');
+});
+
+test.each([
+  ['https://github.com/o/r.git', 'o/r'],
+  ['git@github.com:o/r.git', 'o/r'],
+  ['https://esau@github.com/o/r.git', 'o/r'],
+  ['https://x-access-token:secret@github.com/o/r', 'o/r'],
+  ['ssh://git@github.com:22/o/r.git', 'o/r'],
+  ['https://gitlab.com/o/r.git', null],
+])('the remote %s is the GitHub repository %s', (remote, repository) => {
+  expect(githubRepository(remote)).toBe(repository);
+});
+
+test.each([
+  {
+    name: 'an annotated tag, through its peeled commit',
+    output: `${'b'.repeat(40)}\trefs/tags/v0.3.0\n${sha}\trefs/tags/v0.3.0^{}\n`,
+    commit: sha,
+  },
+  {
+    name: 'a lightweight tag',
+    output: `${sha}\trefs/tags/v0.3.0\n`,
+    commit: sha,
+  },
+  {
+    name: 'another version only',
+    output: `${sha}\trefs/tags/v0.3.0-alpha.1\n`,
+    commit: null,
+  },
+])('the pinned commit comes from $name', ({ output, commit }) => {
+  expect(tagCommit(output, '0.3.0')).toBe(commit);
+});
+
+test('a push refused for the workflow scope says how to fix it', () => {
+  expect(
+    pushFailure(
+      " ! [remote rejected] observed/setup -> observed/setup (refusing to allow a Personal Access Token to create or update workflow `.github/workflows/observed.yml` without `workflow` scope)\nerror: failed to push some refs to 'https://github.com/o/r.git'",
+    ),
+  ).toContain('workflow scope');
+});
+
+test('a refused push reports the rejected line, not the last one', () => {
+  expect(
+    pushFailure(
+      " ! [remote rejected] observed/setup -> observed/setup (pre-receive hook declined)\nerror: failed to push some refs to 'https://github.com/o/r.git'",
+    ),
+  ).toContain('pre-receive hook declined');
+});
+
+test('the required-check step never changes settings, and without gh only links to them', async () => {
+  const withGh = recordingShell();
+  const withoutGh = recordingShell();
+  const run = (shell: Shell, gh: boolean) =>
+    Effect.runPromise(
+      requiredCheckStep({
+        shell,
+        gh,
+        repository: 'o/r',
+        base: 'main',
+        cwd: root,
+      }),
+    );
+
+  expect((await run(withGh.shell, true)).status).toBe('skipped');
+  expect(withGh.commands.map((argv) => argv.slice(0, 3).join(' '))).toEqual([
+    'gh api repos/o/r/rules/branches/main',
+  ]);
+
+  const linked = await run(withoutGh.shell, false);
+
+  expect(withoutGh.commands).toEqual([]);
+  expect(linked.detail).toContain('https://github.com/o/r/settings/rules');
 });
 
 test.each([
