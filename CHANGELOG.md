@@ -4,6 +4,62 @@ Observed follows [semantic versioning](https://semver.org/). Before 1.0.0, a
 minor version can change the project configuration, the evidence format, or the
 action's inputs.
 
+## 0.2.0-alpha.2 (2026-09-28)
+
+Third alpha of 0.2.0, published under the npm dist-tag `alpha`. The action's
+inputs and outputs are unchanged, and its `v0` tag stays on 0.1.0.
+
+- **Bare `observed` sets up what is missing.** Run it in your app's directory.
+  It checks Bun and the browser, has your coding agent write `observed.json`,
+  captures the app and opens the viewer, then offers a pull request that runs
+  Observed on every pull request. Without a terminal, or with `--json`, it asks
+  nothing, prints the next step and exits `3` when it stopped at a setup step.
+  `--yes` answers yes to every question, and `--dry-run` prints the remaining
+  steps without changing anything.
+- **Your own agent writes `observed.json`.** When the file is missing or
+  invalid, `observed` offers to open Claude Code, Codex, OpenCode or `opencode2`
+  in its own interactive session with one message that points to
+  `observed skill`, and continues when you quit the agent. OpenCode 2 fills in
+  the message and waits for Enter. You can also print the message for any other
+  agent.
+- **`observed skill` and `observed schema`.** The first prints the guide an
+  agent follows, with every command running the same version: `observed` when
+  that version is installed, and otherwise
+  `bunx @observed-software/cli@0.2.0-alpha.2`. The second prints the JSON
+  Schema for `observed.json`.
+- **The setup pull request works without the GitHub CLI.** One question, yes
+  by default. `observed` pushes an `observed/setup` branch with your Git
+  credentials. With `gh` signed in, `gh` opens the pull request; otherwise
+  `observed` opens GitHub's pull request page with the title and description
+  filled in. The workflow is pinned to this
+  release's commit, and `.github/dependabot.yml` is added when the default
+  branch has none. `observed` links to the ruleset settings and never changes
+  them.
+- **Every problem in `observed.json` at once.** A rejected `observed.json` now
+  lists every issue, in the CLI and in the action, not only the first.
+
+## 0.2.0-alpha.1 (2026-09-28)
+
+Second alpha of 0.2.0, published under the npm dist-tag `alpha`. The action's
+`v0` tag stays on 0.1.0; pin the `v0.2.0-alpha.1` commit SHA to try it.
+
+- **No GitHub App needed.** The action posts with the workflow's own token
+  through the new `github-token` input, which defaults to `${{ github.token }}`.
+  Grant `checks: write` and `pull-requests: write` in the workflow's
+  `permissions:`.
+- **The job is the check.** The action titles the job's own check run with the
+  verdict, and the job passes or fails on the result. It no longer posts a
+  separate "Observed" check. Name the job `Observed` and require it. A preview,
+  or a run with no named checks, passes with a title that says so.
+- **Your own App only signs the comment.** `github-app-client-id` and
+  `github-app-private-key` still work. If one of them is empty, the run shows an
+  error naming it and posts with the workflow token.
+- **Every run says what it posted.** The job summary and the check end with a
+  line such as `Posted: check title and comment.` Anything not posted gets an
+  annotation with the reason. A refused write names the missing permission, and
+  a fork pull request gets a notice that its token is read-only.
+- `job-outcome` is deprecated. It has no effect and prints a warning.
+
 ## 0.2.0-alpha.0 (2026-09-27)
 
 First alpha of 0.2.0. It is published under the npm dist-tag `alpha`, so

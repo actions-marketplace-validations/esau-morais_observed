@@ -33,6 +33,18 @@ refresh is five changes:
 - Line delivery, after source anchors and the summary: check-run annotations and review comments.
 - Posting modes, after the summary: the `comment` input and the `/observed` workflow.
 
+Decision, 2026-09-28: the maintainer chose setup without a GitHub App. The
+action posts with the workflow token and the job's own check carries the
+verdict, and bare `observed` runs the missing setup steps and offers a setup
+pull request. It opens the person's own coding agent in its interactive
+session with one message that points to `observed skill`, a guide printed by
+the CLI for its own version.
+[PRODUCT.md](PRODUCT.md#github-slack-and-unattended-use) and
+[ARCHITECTURE.md](ARCHITECTURE.md#reuse-and-adapters) own the rules. An
+`observed setup github` App command, a public App with token exchange, fork
+comments through `workflow_run`, and installing the Observed skill into a
+repository or agent wait for pilot demand.
+
 Read only the document relevant to the task:
 
 | Task | Document |

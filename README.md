@@ -23,7 +23,8 @@ observed setup
 
 Bun reports one blocked postinstall. It belongs to agent-browser, which already
 ships its binaries, so leave it blocked. `observed setup` downloads the Chrome
-build Observed captures with, about 190 MB. On a Linux machine without desktop
+build Observed captures with, about 190 MB. Bare `observed` offers the same
+download when the browser is missing. On a Linux machine without desktop
 libraries, such as a container, run `observed setup --with-deps` instead; it
 also installs system packages with `sudo apt`.
 
@@ -38,8 +39,63 @@ latest release.
 
 ## Use it on your app
 
-Ask your coding agent to write `observed.json` in your app's directory by
-following [Write observed.json](#write-observedjson). Then, from that directory:
+From your app's directory, run `observed` with no subcommand. It does only the
+setup steps that are still missing, then previews the app:
+
+1. It checks Bun and the browser, and offers to download the browser. It
+   checks whether `origin` is a GitHub repository and whether the GitHub CLI,
+   `gh`, is signed in.
+2. When `observed.json` is missing or invalid, it offers to open a coding agent
+   it finds on `PATH`: `claude`, `codex`, `opencode` or `opencode2`. It only
+   checks that the command exists and never reads an agent's settings or
+   credentials. The agent starts in its own interactive session, under its own
+   permission prompts, with one message: run `observed skill` and follow it.
+   When `observed` on `PATH` is another version or missing, the message names
+   `bunx @observed-software/cli@<version>` instead. OpenCode 2 fills in the
+   message and waits for you to press Enter. When you quit the agent,
+   `observed` checks the file and continues. Decline, or choose **Print a prompt for another agent**
+   when it lists several, to get the same message for any other agent.
+3. It captures the working tree and opens the viewer.
+4. With no Observed workflow yet, it asks one question, yes by default: open a
+   pull request that runs Observed on every pull request.
+
+   The pull request adds `observed.json`, the workflow and, when the default
+   branch has none, `.github/dependabot.yml`, so Dependabot updates the pinned
+   commit. `observed` commits them on an `observed/setup` branch in a separate
+   worktree, so your checkout stays as it is, and pushes it with your own Git
+   credentials. Git never prompts for them.
+
+   With `gh` signed in, `gh` opens the pull request and `observed` first checks
+   the repository's Actions settings. Without `gh`, `observed` opens GitHub's
+   pull request page with the title and a short description filled in, and
+   prints the link; without a terminal it only prints it. Select **Create pull
+   request** there. The same page comes up when the branch is already on
+   origin, or when `gh` cannot open the pull request.
+
+   The workflow is pinned to the commit of the release that matches the CLI,
+   which Git reads from the public Observed repository. A no is remembered in
+   `.observed/setup.json`.
+
+5. It links to the ruleset settings where you can require the **Observed**
+   check. Changing them needs admin rights, so `observed` never does it.
+
+Without a terminal, or with `--json`, `observed` never asks. It prints the next
+step, and with `--json` a `{ "steps", "next", "run" }` object. It exits with `3`
+when it stopped at a setup step, and otherwise with the capture's exit code
+below. `--agent claude|codex|opencode|opencode2|prompt` picks the agent without
+asking, or prints the prompt. An agent opens only in a terminal. `--yes`
+answers yes to the browser download, opening the first agent found, and the
+setup pull request. Give it to an agent only after you agree to those.
+`--dry-run` prints the remaining steps and changes nothing. `--project <dir>`
+runs it for another directory.
+
+`observed skill` prints the guide a coding agent follows to write
+`observed.json` and run captures. Every command in it runs the version that
+printed it: `observed` when that is the installed version, and otherwise
+`bunx @observed-software/cli@<version>`. `observed schema` prints the JSON Schema for `observed.json`.
+
+`observe`, `view` and `setup` each do one step, for scripts and agents. From the
+app's directory:
 
 ```bash
 observed observe --json              # preview the working tree
@@ -564,7 +620,10 @@ a committed `observed.json` following the [project contract](src/project.ts).
 The job needs an `ubuntu-24.04` or `macos-15` runner. On Linux it installs
 packages with passwordless `sudo`, which GitHub-hosted runners provide.
 
-Add `.github/workflows/observed.yml`:
+The quickest way to add it is `bunx @observed-software/cli@alpha` from the app's
+directory. After the first local capture, it offers to open a setup pull request
+with this workflow, and Observed runs on that pull request. To add it by hand,
+create `.github/workflows/observed.yml`:
 
 ```yaml
 name: Observed
@@ -574,7 +633,7 @@ on:
 
 permissions:
   contents: read
-  checks: write         # title this job's check with the result
+  checks: write         # title this job's check with the verdict
   pull-requests: write  # post and update one comment
 
 concurrency:
@@ -591,7 +650,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: esau-morais/observed@ff217d89f43032a878100167856ae08aa44ae1e6 # v0.2.0-alpha.0
+      - uses: esau-morais/observed@5d5f5d5748776415104951226aadf2a4c8c275fd # v0.2.0-alpha.1
         with:
           project: .
           base: ${{ github.event.pull_request.base.sha }}
@@ -607,14 +666,12 @@ The action uses the workflow's own token by default, through its `github-token`
 input. It needs no GitHub App, secret or variable. The `concurrency` block
 cancels an older run, so it can't overwrite the comment with a stale result.
 
-- The full commit SHA pins the action to the `v0.2.0-alpha.0` prerelease; the
+- The full commit SHA pins the action to the `v0.2.0-alpha.1` prerelease; the
   comment names the tag. The action installs `@observed-software/cli` with the
-  same version. That prerelease posts to the pull request only through a
-  [GitHub App](#use-your-own-github-app-optional). Posting with the workflow
-  token and titling the job's check arrive in the next release. To upgrade, use
-  the commit of a newer [release](https://github.com/esau-morais/observed/releases)
-  tag, or let Dependabot's `github-actions` updates propose it. `@v0` follows
-  the latest 0.x release, currently 0.1.0, which lacks inputs such as
+  same version. To upgrade, use the commit of a newer
+  [release](https://github.com/esau-morais/observed/releases) tag, or let
+  Dependabot's `github-actions` updates propose it. `@v0` follows the latest
+  0.x release, currently 0.1.0, which lacks inputs such as `github-token` and
   `slack-images`. A tag can move, so prefer the SHA.
 - `uses:` works for any public repository. The GitHub Marketplace listing is
   only for finding the action.
@@ -642,7 +699,7 @@ step before Observed's, with the version your project uses:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - uses: esau-morais/observed@ff217d89f43032a878100167856ae08aa44ae1e6 # v0.2.0-alpha.0
+      - uses: esau-morais/observed@5d5f5d5748776415104951226aadf2a4c8c275fd # v0.2.0-alpha.1
 ```
 
 Pin those actions by full commit SHA, as here.
@@ -691,7 +748,7 @@ A journey that signs in reads its secret from an environment variable, as in
 `{ "env": "LOGIN_PASSWORD" }`. Pass the repository secret to the action step:
 
 ```yaml
-      - uses: esau-morais/observed@ff217d89f43032a878100167856ae08aa44ae1e6 # v0.2.0-alpha.0
+      - uses: esau-morais/observed@5d5f5d5748776415104951226aadf2a4c8c275fd # v0.2.0-alpha.1
         env:
           LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
         with:
@@ -761,7 +818,7 @@ webhook: the job creates a short-lived token after capture finishes.
    `permissions:` for the check title:
 
 ```yaml
-      - uses: esau-morais/observed@ff217d89f43032a878100167856ae08aa44ae1e6 # v0.2.0-alpha.0
+      - uses: esau-morais/observed@5d5f5d5748776415104951226aadf2a4c8c275fd # v0.2.0-alpha.1
         with:
           project: .
           base: ${{ github.event.pull_request.base.sha }}

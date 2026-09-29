@@ -1,6 +1,16 @@
 import { BunRuntime, BunServices } from '@effect/platform-bun';
-import { Cause, Console, Effect, FileSystem, Option, Schema } from 'effect';
-import { Argument, Command, Flag } from 'effect/unstable/cli';
+import {
+  Cause,
+  Console,
+  Effect,
+  FileSystem,
+  Option,
+  Result,
+  Schema,
+} from 'effect';
+import { Argument, Command, Flag, Prompt } from 'effect/unstable/cli';
+import { accessSync, constants } from 'node:fs';
+import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { captureApplication } from './capture/coordinator';
@@ -10,7 +20,30 @@ import { json } from './encoding';
 import { exportComparison } from './export';
 import { agentBrowserPath, unsupportedBun } from './installation';
 import { importExitCodes, importPlaywright } from './playwright/import';
-import { loadProject } from './project';
+import {
+  agentLaunch,
+  agents,
+  agentTitles,
+  cliCommand,
+  detectAgents,
+  githubRepository,
+  openCodeMajor,
+  guideSection,
+  requiredCheckStep,
+  defaultBranch,
+  setupPrompt,
+  shellPath,
+  skillText,
+  workflowStep,
+  type Agent,
+  type Ask,
+  type Consent,
+  type Answer,
+  type Say,
+  type Shell,
+  type Step,
+} from './guided-setup';
+import { loadProject, projectSchema } from './project';
 import { serveReport, ViewFailure } from './view';
 import { buildViewer, runProject } from './workflow';
 
@@ -435,6 +468,769 @@ const setup = Command.make(
   }),
 ).pipe(Command.withDescription('Download the Chrome build that capture uses'));
 
+const skill = Command.make(
+  'skill',
+  {},
+  Effect.fn('skillCommand')(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const readme = yield* fs
+      .readFileString(path.join(toolRoot, 'README.md'))
+      .pipe(Effect.orElseSucceed(() => ''));
+    const version = yield* observedVersion(toolRoot);
+    const text = skillText({
+      cli: yield* installedCli(version),
+      version,
+      guide: guideSection(readme),
+    });
+
+    yield* Effect.sync(() => process.stdout.write(text));
+  }),
+).pipe(
+  Command.withDescription(
+    'Print the guide a coding agent follows to set up and run Observed',
+  ),
+);
+
+const schema = Command.make('schema', {}, () =>
+  printJson(Schema.toJsonSchemaDocument(projectSchema).schema),
+).pipe(Command.withDescription('Print the JSON Schema for observed.json'));
+
+// Exit code when bare observed stops at a setup step it cannot take alone.
+const setupNeeded = 3;
+
+// The shell's exit code for a command that is not installed.
+const notFound = 127;
+
+const bunShell: Shell = (argv, options) =>
+  Effect.promise(async () => {
+    try {
+      const child = Bun.spawn([...argv], {
+        cwd: options.cwd,
+        env: { ...process.env, ...options.env },
+        stdin:
+          options.input === undefined
+            ? 'ignore'
+            : new TextEncoder().encode(options.input),
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [code, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+
+      return { code, stdout, stderr };
+    } catch (error) {
+      return {
+        code: notFound,
+        stdout: '',
+        stderr: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+
+// Gives the terminal to an interactive agent and waits for it to exit. The
+// prompt library leaves raw mode on for a moment after its last question, and
+// the agent would inherit it: no Ctrl+C, and raw mode again once it exits.
+const handOver = (argv: readonly string[], cwd: string) =>
+  Effect.promise(async () => {
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(false);
+    }
+
+    // observed.json decides what happens next, not how the agent exited, so
+    // only a failure to start is reported.
+    try {
+      await Bun.spawn([...argv], {
+        cwd,
+        stdin: 'inherit',
+        stdout: 'inherit',
+        stderr: 'inherit',
+      }).exited;
+
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  });
+
+// Best effort, and never awaited: xdg-open can start a browser that keeps its
+// output open until it quits. The URL is always printed as well, for SSH
+// sessions and machines without a desktop.
+const openInBrowser = (url: string) =>
+  Effect.try(() =>
+    Bun.spawn([process.platform === 'darwin' ? 'open' : 'xdg-open', url], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    }).unref(),
+  ).pipe(Effect.ignore);
+
+// Another program named observed must not hold up setup, even when a child it
+// started keeps the output open, so the read stops at the deadline too.
+const installedCli = (version: string) =>
+  Effect.promise(async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      const child = Bun.spawn(['observed', '--version'], {
+        cwd: homedir(),
+        env: { ...process.env, PATH: shellPath(process.env.PATH ?? '') },
+        stdin: 'ignore',
+        stdout: 'pipe',
+        stderr: 'ignore',
+        timeout: 3000,
+      });
+      const reader = child.stdout.getReader();
+      const read = async () => {
+        const decoder = new TextDecoder();
+        let text = '';
+
+        for (;;) {
+          const chunk = await reader.read();
+
+          if (chunk.done) {
+            return text;
+          }
+
+          text += decoder.decode(chunk.value, { stream: true });
+        }
+      };
+
+      const output = await Promise.race([
+        read(),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => {
+            reader.cancel().catch(() => undefined);
+            resolve(null);
+          }, 3000);
+        }),
+      ]);
+
+      return cliCommand(version, (await child.exited) === 0 ? output : null);
+    } catch {
+      return cliCommand(version, null);
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+const isExecutable = (file: string) => {
+  try {
+    accessSync(file, constants.X_OK);
+
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+function consentFor(options: {
+  dryRun: boolean;
+  yes: boolean;
+  interactive: boolean;
+}): Consent {
+  if (options.dryRun) {
+    return 'dry-run';
+  }
+
+  if (options.yes) {
+    return 'yes';
+  }
+
+  return options.interactive ? 'ask' : 'no-terminal';
+}
+
+const agentChoiceFlag = Flag.Literals('agent', [
+  ...agents,
+  'prompt',
+] as const).pipe(
+  Flag.withDescription(
+    'Agent to open when observed.json is missing or invalid, or prompt to print the setup prompt instead',
+  ),
+  Flag.optional,
+);
+
+type Next = { step: string; instruction: string; prompt?: string };
+type ExportedComparison = Effect.Success<ReturnType<typeof runProject>>;
+
+const guided = Effect.fn('guidedSetup')(function* (options: {
+  project: string;
+  agent: Option.Option<Agent | 'prompt'>;
+  yes: boolean;
+  dryRun: boolean;
+  machine: boolean;
+  timeout: number;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const version = yield* observedVersion(toolRoot);
+  const projectRoot = yield* fs.realPath(path.resolve(options.project));
+  const interactive =
+    !options.machine &&
+    process.stdin.isTTY === true &&
+    process.stdout.isTTY === true;
+  const consent = consentFor({ ...options, interactive });
+  const steps: Step[] = [];
+  const say: Say = (text) =>
+    options.machine ? Effect.void : Console.log(text);
+  const terminal = yield* Effect.context<Prompt.Environment>();
+  const ask: Ask = (message, initial = false) =>
+    Prompt.run(Prompt.Confirm({ message, initial })).pipe(
+      Effect.map((yes): Answer => (yes ? 'yes' : 'no')),
+      Effect.orElseSucceed((): Answer => 'cancelled'),
+      Effect.provideContext(terminal),
+    );
+  const marks = {
+    done: '✓',
+    skipped: '-',
+    planned: '·',
+    declined: '-',
+    'needs-answer': '?',
+    failed: '✗',
+  } satisfies Record<Step['status'], string>;
+  const record = (step: Step) =>
+    Effect.gen(function* () {
+      steps.push(step);
+      yield* say(`${marks[step.status]} ${step.detail}`);
+    });
+  const finish = (
+    next: Next | null,
+    run: ExportedComparison | null,
+    code: number,
+  ) =>
+    Effect.gen(function* () {
+      if (options.machine) {
+        yield* printJson({ steps, next, run });
+      } else if (next !== null) {
+        yield* Console.log(
+          `\nNext: ${next.instruction}${next.prompt === undefined ? '' : `\n\n${next.prompt}`}`,
+        );
+      }
+
+      process.exitCode = code;
+    });
+
+  yield* record({ id: 'bun', status: 'done', detail: `Bun ${Bun.version}` });
+
+  const browsers = path.join(homedir(), '.agent-browser', 'browsers');
+  const browserReady =
+    (yield* fs
+      .readDirectory(browsers)
+      .pipe(Effect.orElseSucceed((): string[] => []))).length > 0;
+
+  if (browserReady) {
+    yield* record({
+      id: 'browser',
+      status: 'done',
+      detail: 'Browser installed',
+    });
+  } else if (consent === 'dry-run') {
+    yield* record({
+      id: 'browser',
+      status: 'planned',
+      detail:
+        'Would download Chrome for Testing with observed setup, about 190 MB',
+    });
+  } else {
+    const install =
+      consent === 'yes' ||
+      (consent === 'ask' &&
+        (yield* ask('Download Chrome for Testing now, about 190 MB?')) ===
+          'yes');
+
+    if (!install) {
+      yield* record({
+        id: 'browser',
+        status: 'needs-answer',
+        detail: 'No browser to capture with',
+      });
+
+      return yield* finish(
+        {
+          step: 'browser',
+          instruction: 'Run observed setup, then observed again.',
+        },
+        null,
+        setupNeeded,
+      );
+    }
+
+    const installed = yield* Effect.promise(
+      () =>
+        Bun.spawn([process.execPath, agentBrowserPath(toolRoot), 'install'], {
+          stdin: 'ignore',
+          stdout: options.machine ? 2 : 'inherit',
+          stderr: 'inherit',
+        }).exited,
+    );
+
+    if (installed !== 0) {
+      yield* record({
+        id: 'browser',
+        status: 'failed',
+        detail: 'The browser download failed',
+      });
+
+      return yield* finish(
+        {
+          step: 'browser',
+          instruction:
+            'Run observed setup, or observed setup --with-deps on Linux without desktop libraries, then observed again.',
+        },
+        null,
+        1,
+      );
+    }
+
+    yield* record({
+      id: 'browser',
+      status: 'done',
+      detail: 'Browser installed',
+    });
+  }
+
+  const gh =
+    (yield* bunShell(['gh', 'auth', 'status'], { cwd: projectRoot })).code ===
+    0;
+  const git = yield* bunShell(['git', 'rev-parse', '--show-toplevel'], {
+    cwd: projectRoot,
+  });
+  const gitRoot = git.code === 0 ? git.stdout.trim() : null;
+  const origin =
+    gitRoot === null
+      ? null
+      : yield* bunShell(['git', 'remote', 'get-url', 'origin'], {
+          cwd: gitRoot,
+        });
+  const repository =
+    origin?.code === 0 ? githubRepository(origin.stdout) : null;
+
+  if (repository === null) {
+    let reason = 'origin is not a GitHub repository.';
+
+    if (git.code === notFound) {
+      reason = 'Git is not installed.';
+    } else if (gitRoot === null) {
+      reason = 'this directory is not in a Git repository.';
+    } else if (origin?.code !== 0) {
+      reason = 'this repository has no origin remote.';
+    }
+
+    yield* record({
+      id: 'github',
+      status: 'skipped',
+      detail: `GitHub steps skipped: ${reason}`,
+    });
+  } else {
+    yield* record({
+      id: 'github',
+      status: 'done',
+      detail: gh
+        ? `GitHub repository ${repository}, GitHub CLI signed in`
+        : `GitHub repository ${repository}. Without the GitHub CLI, Observed opens the pull request page in your browser.`,
+    });
+  }
+
+  const project =
+    gitRoot === null
+      ? '.'
+      : path.relative(yield* fs.realPath(gitRoot), projectRoot);
+  const projectPath = project === '' ? '.' : project;
+  const capture = Effect.gen(function* () {
+    return yield* runProject({
+      projectRoot,
+      toolRoot,
+      directory: yield* chooseDirectory(Option.none(), 'run', projectRoot),
+      baseRevision: null,
+      candidateRevision: null,
+      timeoutMs: options.timeout,
+      quiet: options.machine,
+    });
+  });
+  const loaded = yield* loadProject(projectRoot).pipe(Effect.result);
+  let run: ExportedComparison | null = null;
+  let configured = false;
+
+  if (Result.isSuccess(loaded)) {
+    yield* record({
+      id: 'config',
+      status: 'done',
+      detail: 'observed.json is valid',
+    });
+  } else {
+    const missing = !(yield* fs.exists(
+      path.join(projectRoot, 'observed.json'),
+    ));
+    const found = detectAgents(process.env.PATH ?? '', isExecutable);
+    const openCodeVersion = found.includes('opencode')
+      ? (yield* bunShell(['opencode', '--version'], { cwd: projectRoot }))
+          .stdout
+      : null;
+    // OpenCode's installer can add opencode2 as a wrapper around the same
+    // opencode, so it is offered once.
+    const sameOpenCode =
+      openCodeVersion !== null &&
+      found.includes('opencode2') &&
+      (yield* bunShell(['opencode2', '--version'], { cwd: projectRoot }))
+        .stdout === openCodeVersion;
+    const detected = sameOpenCode
+      ? found.filter((agent) => agent !== 'opencode2')
+      : found;
+    const cli = yield* installedCli(version);
+    const prompt = setupPrompt(cli, missing ? 'missing' : 'invalid');
+    const plan = () => {
+      const chosen = Option.getOrNull(options.agent);
+
+      if (chosen === 'prompt' || !interactive || detected.length === 0) {
+        return `Would print this prompt for your coding agent: ${prompt}`;
+      }
+
+      if (chosen !== null) {
+        return `Would open ${agentTitles[chosen]} with: ${prompt}`;
+      }
+
+      return `Would offer to open ${detected.map((agent) => agentTitles[agent]).join(' or ')} with: ${prompt}`;
+    };
+
+    yield* record({
+      id: 'config',
+      status: 'needs-answer',
+      detail: missing
+        ? 'No observed.json yet'
+        : `observed.json is invalid: ${loaded.failure.message}`,
+    });
+
+    if (consent === 'dry-run') {
+      yield* record({ id: 'config', status: 'planned', detail: plan() });
+    } else {
+      const choose = (): Effect.Effect<
+        Agent | 'prompt' | 'cancelled' | null
+      > => {
+        const [first] = detected;
+
+        if (Option.isSome(options.agent)) {
+          return Effect.succeed(options.agent.value);
+        }
+
+        if (!interactive) {
+          return Effect.succeed(null);
+        }
+
+        if (first === undefined) {
+          return Effect.succeed('prompt');
+        }
+
+        if (consent === 'yes') {
+          return Effect.succeed(first);
+        }
+
+        if (detected.length === 1) {
+          return ask(
+            `Open ${agentTitles[first]} here to set up observed.json?`,
+            true,
+          ).pipe(
+            Effect.map((answer) => {
+              switch (answer) {
+                case 'yes':
+                  return first;
+                case 'no':
+                  return 'prompt' as const;
+                case 'cancelled':
+                  return 'cancelled' as const;
+              }
+            }),
+          );
+        }
+
+        return Prompt.run(
+          Prompt.Select<Agent | 'prompt'>({
+            message: 'Set up observed.json with',
+            choices: [
+              ...detected.map((agent) => ({
+                title: agentTitles[agent],
+                value: agent,
+              })),
+              {
+                title: 'Print a prompt for another agent',
+                value: 'prompt' as const,
+              },
+            ],
+          }),
+        ).pipe(
+          Effect.orElseSucceed(() => 'cancelled' as const),
+          Effect.provideContext(terminal),
+        );
+      };
+
+      const chosen = yield* choose();
+
+      if (chosen === 'cancelled') {
+        return yield* finish(
+          {
+            step: 'config',
+            instruction: 'Run observed again to set up observed.json.',
+          },
+          null,
+          setupNeeded,
+        );
+      }
+
+      if (chosen === null || chosen === 'prompt') {
+        return yield* finish(
+          {
+            step: 'config',
+            instruction:
+              'Give this prompt to your coding agent, then run observed again.',
+            prompt,
+          },
+          null,
+          setupNeeded,
+        );
+      }
+
+      if (!interactive || !detected.includes(chosen)) {
+        yield* record({
+          id: 'config',
+          status: 'failed',
+          detail: interactive
+            ? `${chosen} is not on PATH`
+            : `${agentTitles[chosen]} opens only in a terminal, and never with --json`,
+        });
+
+        return yield* finish(
+          {
+            step: 'config',
+            instruction:
+              'Give this prompt to your coding agent, then run observed again.',
+            prompt,
+          },
+          null,
+          setupNeeded,
+        );
+      }
+
+      const launch = agentLaunch(
+        chosen,
+        prompt,
+        chosen === 'opencode' && openCodeVersion !== null
+          ? openCodeMajor(openCodeVersion)
+          : null,
+      );
+
+      yield* say(
+        `Opening ${agentTitles[chosen]} with: ${prompt}\n${launch.sends ? '' : `Press Enter in ${agentTitles[chosen]} to send it. `}Quit it when observed.json works, and setup continues here.`,
+      );
+      const failedToStart = yield* handOver(launch.argv, projectRoot);
+
+      if (failedToStart !== null) {
+        yield* record({
+          id: 'config',
+          status: 'failed',
+          detail: `${agentTitles[chosen]} did not start: ${failedToStart}`,
+        });
+
+        return yield* finish(
+          {
+            step: 'config',
+            instruction:
+              'Give this prompt to your coding agent, then run observed again.',
+            prompt,
+          },
+          null,
+          setupNeeded,
+        );
+      }
+
+      const checked = yield* loadProject(projectRoot).pipe(Effect.result);
+
+      if (Result.isFailure(checked)) {
+        const written = yield* fs.exists(
+          path.join(projectRoot, 'observed.json'),
+        );
+
+        yield* record({
+          id: 'config',
+          status: written ? 'failed' : 'needs-answer',
+          detail: written
+            ? `observed.json is still not valid: ${checked.failure.message}`
+            : 'No observed.json yet',
+        });
+
+        return yield* finish(
+          {
+            step: 'config',
+            instruction:
+              'Give this prompt to your coding agent, then run observed again.',
+            prompt: setupPrompt(cli, written ? 'invalid' : 'missing'),
+          },
+          null,
+          setupNeeded,
+        );
+      }
+
+      yield* record({
+        id: 'config',
+        status: 'done',
+        detail: 'observed.json is valid',
+      });
+      configured = true;
+    }
+  }
+
+  if (consent === 'dry-run') {
+    yield* record({
+      id: 'capture',
+      status: 'planned',
+      detail: 'Would capture the working tree and open the viewer',
+    });
+  } else {
+    run = yield* capture;
+    yield* saveLatest(run.directory, projectRoot);
+
+    const { conclusion } = run.result;
+
+    yield* record({
+      id: 'capture',
+      status: conclusion.kind === 'unavailable' ? 'failed' : 'done',
+      detail: `${run.result.title}: ${conclusion.text}`,
+    });
+
+    if (conclusion.kind === 'unavailable') {
+      return yield* finish(
+        configured
+          ? {
+              step: 'capture',
+              instruction:
+                'Give this prompt to your coding agent, then run observed again.',
+              prompt: setupPrompt(yield* installedCli(version), 'unavailable'),
+            }
+          : null,
+        run,
+        exitCodes.unavailable,
+      );
+    }
+  }
+
+  const viewer =
+    interactive && run !== null
+      ? yield* serveReport({ directory: run.directory, port: 4173 })
+      : null;
+
+  if (viewer !== null && run !== null) {
+    yield* say(`Viewer: ${String(viewer)}\nEvidence: ${run.directory}`);
+  }
+
+  let next: Next | null = null;
+  let setupStopped = false;
+
+  if (repository !== null && gitRoot !== null) {
+    const scratch = yield* fs.makeTempDirectoryScoped({
+      prefix: 'observed-setup-',
+    });
+    const workflow = yield* workflowStep({
+      shell: bunShell,
+      gh,
+      ask,
+      say,
+      consent,
+      gitRoot,
+      project: projectPath,
+      repository,
+      version,
+      observed: evidenceRoot(projectRoot),
+      scratch,
+    });
+
+    yield* record(workflow.step);
+
+    if (workflow.kind === 'waiting') {
+      next = { step: 'workflow', instruction: workflow.next };
+      setupStopped = !interactive;
+    }
+
+    if (workflow.kind === 'pushed') {
+      if (interactive) {
+        yield* openInBrowser(workflow.open);
+        yield* say(
+          `Create the pull request in the browser, or open it there if it already exists. If no browser opened, open ${workflow.open}`,
+        );
+      } else {
+        next = {
+          step: 'workflow',
+          instruction: `Open this page to create the pull request, or to find it if it already exists: ${workflow.open}`,
+        };
+        setupStopped = true;
+      }
+    }
+
+    if (workflow.kind === 'stopped' && workflow.step.status === 'failed') {
+      next = { step: 'workflow', instruction: workflow.step.detail };
+      setupStopped = true;
+    }
+
+    let base: string | null = null;
+
+    if (workflow.kind === 'ready' || workflow.kind === 'pushed') {
+      base = workflow.base ?? (yield* defaultBranch(bunShell, gitRoot));
+    }
+
+    if (base !== null) {
+      yield* record(
+        yield* requiredCheckStep({
+          shell: bunShell,
+          gh,
+          repository,
+          base,
+          cwd: gitRoot,
+        }),
+      );
+    }
+  }
+
+  const captured = run === null ? 0 : exitCodes[run.result.conclusion.kind];
+
+  // An unfinished setup step outranks a clean capture, not a failed check.
+  yield* finish(
+    next,
+    run,
+    captured === 0 && setupStopped ? setupNeeded : captured,
+  );
+
+  if (viewer !== null) {
+    yield* Console.log('Press Ctrl+C to stop the viewer.');
+    yield* Effect.never;
+  }
+});
+
+const root = Command.make(
+  'observed',
+  {
+    project: Flag.String('project').pipe(
+      Flag.withDescription('Directory containing observed.json; default .'),
+      Flag.withDefault('.'),
+    ),
+    agent: agentChoiceFlag,
+    yes: Flag.Boolean('yes').pipe(
+      Flag.withDescription(
+        'Answer yes to the browser download, opening the first agent found, and the setup pull request',
+      ),
+      Flag.withDefault(false),
+    ),
+    dryRun: Flag.Boolean('dry-run').pipe(
+      Flag.withDescription(
+        'Print the remaining setup steps and change nothing',
+      ),
+      Flag.withDefault(false),
+    ),
+    machine: machineFlag,
+    timeout: timeoutFlag,
+  },
+  guided,
+).pipe(
+  Command.withDescription(
+    'Run the setup steps still missing, then preview the app. observe, view and setup do one step each',
+  ),
+);
+
 const unsupported = unsupportedBun();
 
 if (unsupported !== null) {
@@ -444,7 +1240,7 @@ if (unsupported !== null) {
 
 observedVersion(toolRoot).pipe(
   Effect.flatMap((version) =>
-    Command.make('observed').pipe(
+    root.pipe(
       Command.withSubcommands([
         observe,
         setup,
@@ -452,6 +1248,8 @@ observedVersion(toolRoot).pipe(
         compare,
         view,
         importCommand,
+        skill,
+        schema,
       ]),
       Command.run({ version }),
     ),
