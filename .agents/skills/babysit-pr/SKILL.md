@@ -104,3 +104,42 @@ Report PR URL/state, reviewed head, separate review results, executed checks,
 unverified scope, and branch cleanup. If approval is pending, say so. Claim a
 continuing watcher only while an actual process is running; unattended handling
 requires a separately configured event runner.
+
+## Decide on a release
+
+After every merge to `main`, decide whether to release. The maintainer does not
+ask for releases.
+
+- Release now when the changes since the last tag fix a defect people hit in the
+  CLI, action, or viewer, or complete a roadmap item people are waiting for.
+- Wait when an open PR that belongs in the same release is ready or close to it.
+  Name that PR, and release once it merges or when it stalls for a day.
+- Skip a release for changes limited to docs, tests, CI, or contributor skills.
+
+Choose the stage from the state of the version's scope, not from how the release
+feels:
+
+| Stage | When |
+| --- | --- |
+| `alpha` | Roadmap items for this version are still landing, or `observed.json`, the evidence format or action inputs may still change |
+| `beta` | The version's roadmap items have merged; only fixes and polish remain, and those contracts change only to fix a defect |
+| `rc` | No known release-blocking defect, and the beta ran on real projects without one |
+| stable | An `rc` went unchanged through real use. Only a stable release moves the major tag, such as `v0`, which every unpinned workflow follows |
+
+Increase the number within a stage, such as `0.2.0-alpha.2` to `0.2.0-alpha.3`,
+and restart it at `.0` when the stage changes. Never go back a stage. `0.1.0`
+went stable without passing through these stages and is the only release that
+breaks the pattern; do not repeat it.
+
+To release, follow the README's release section:
+
+1. Open `chore(release): prepare <version>` with the `package.json` version and
+   a `CHANGELOG.md` entry in the existing style: what changed for people using
+   Observed, and whether action inputs and the `v0` tag change. Merge it through
+   this workflow.
+2. Tag the merge commit on `main` as `v<version>`, push the tag, and watch the
+   Release workflow. Confirm the npm version and dist-tag and the GitHub release.
+3. Open a PR that pins the `self-observe` job and the README's workflow examples
+   to the release commit.
+
+Report the decision either way, with the reason and any PR you are waiting for.
