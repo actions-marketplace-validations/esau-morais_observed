@@ -75,6 +75,7 @@ Keep these dimensions separate:
 | Check against base | Regression, when the base passed the same expectation |
 | Run conclusion | Regression, check failed, unavailable, no regression, not checked, preview |
 | Artifact integrity | Hash matched, unavailable |
+| Changed file | Checked, exercised, not observed, outside the captured source |
 | Interpretation | Expected change, suspected regression, confirmed regression |
 
 - A behavior can change while its checks pass.
@@ -115,8 +116,10 @@ dictionary, which ASD holds the copyright to.
 
 ## Change scope
 
-Planned for Phase 3a. Not built. Today a result covers its named checks and
-says nothing about the files a change touched.
+Built as `result.json` data and as text in the report, the job summary, and
+the pull request comment. The change map, coverage, recipe differences, and
+generated journeys are not built. Until a coverage collector exists, no file
+is "exercised" through coverage.
 
 A saved journey checks the behavior it exercises. It does not check the
 change. Every comparison lists each file that differs between base and
@@ -245,7 +248,10 @@ policy, not a verdict.
 A run whose checks all pass while files are not observed reads "No regression
 in the named checks", followed by the count of files not observed. It never
 reads as a verified change. When no captured file changed, say so, because
-the checks then describe unchanged behavior.
+the checks then describe unchanged behavior. If files outside the captured
+source changed, or Git could not list them, say only that no captured file
+changed. A change outside the snapshot can still change behavior, and gate 7
+asks the result to claim nothing about the change.
 
 ## What each source establishes
 
