@@ -6,6 +6,9 @@ import {
   conclusionLabels,
   executionLabels,
   integrityLabels,
+  runLabel,
+  unobservedAfterPassing,
+  unobservedText,
   verdictLabels,
 } from './result-text';
 import type {
@@ -338,7 +341,9 @@ export function renderComparison(result: Comparison): string {
     `# ${escapeText(result.title)}`,
     ...(single?.screenshots ?? []),
     '## Conclusion',
-    `**${conclusionLabels[result.conclusion.kind]}**`,
+    unobservedAfterPassing(result) > 0
+      ? `**${runLabel(result)}** · ${unobservedText(unobservedAfterPassing(result))}`
+      : `**${runLabel(result)}**`,
     escapeText(result.conclusion.text),
     `${escapeText(checkSummary(result))}.`,
     ...(result.mode === 'preview' ? [] : renderChangeScope(result)),

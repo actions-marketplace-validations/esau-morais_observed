@@ -202,6 +202,34 @@ export function anchorLocation(
   return null;
 }
 
+// Changed files that no evidence touched in a run whose checks all passed,
+// or 0. Passing checks say nothing about those files, so the run's word names
+// the checks instead, and its tone is not the passing one.
+export function unobservedAfterPassing(result: Comparison): number {
+  return result.conclusion.kind === 'no-regression' &&
+    result.changeScope.kind === 'recorded'
+    ? result.changeScope.files.filter(
+        (file) => file.relation === 'not-observed',
+      ).length
+    : 0;
+}
+
+export function runLabel(result: Comparison): string {
+  return unobservedAfterPassing(result) > 0
+    ? statusWords.noRegressionInNamedChecks.word
+    : conclusionLabels[result.conclusion.kind];
+}
+
+export function runTone(result: Comparison): Tone {
+  return unobservedAfterPassing(result) > 0
+    ? 'neutral'
+    : conclusionTones[result.conclusion.kind];
+}
+
+export function unobservedText(count: number): string {
+  return `${plural(count, 'changed file', 'changed files')} not observed`;
+}
+
 export function headlineParts(result: Comparison): {
   label: string;
   subject: string;
@@ -216,13 +244,15 @@ export function headlineParts(result: Comparison): {
 
   if (captureFailed) {
     subject = captureFailure(result);
+  } else if (unobservedAfterPassing(result) > 0) {
+    subject = unobservedText(unobservedAfterPassing(result));
   } else if (first !== undefined) {
     const measure = shownMeasure(first.check);
 
     subject = `${measure === null ? first.check.name : describeMeasure(measure, result.mode)}${rest.length === 0 ? '' : `, plus ${plural(rest.length, 'more check', 'more checks')}`}`;
   }
 
-  return { label: conclusionLabels[kind], subject, restated: captureFailed };
+  return { label: runLabel(result), subject, restated: captureFailed };
 }
 
 function captureFailure(result: Comparison): string {

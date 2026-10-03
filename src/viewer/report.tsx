@@ -17,6 +17,7 @@ import {
   anchorLocation,
   conclusionLabels,
   conclusionTones,
+  runTone,
   describeMeasure,
   executionLabels,
   headlineParts,
@@ -1411,9 +1412,9 @@ function JourneyView({
 }
 
 function Verdict({ result }: { result: Comparison }) {
-  const tone = conclusionTones[result.conclusion.kind];
+  const tone = runTone(result);
   const multiple = result.journeys.length > 1;
-  const { subject, restated } = headlineParts(result);
+  const { label, subject, restated } = headlineParts(result);
   const unresolved = groupUnresolved(result);
   const [first] = result.journeys;
   const source = (side: Side) =>
@@ -1427,7 +1428,7 @@ function Verdict({ result }: { result: Comparison }) {
         <span aria-hidden="true" {...stylex.props(styles.symbol)}>
           {toneSymbols[tone]}
         </span>
-        {conclusionLabels[result.conclusion.kind]}
+        {label}
       </p>
       <h1 id="report-title" {...stylex.props(styles.title)}>
         {result.title}
