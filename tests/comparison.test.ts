@@ -19,7 +19,7 @@ import {
 } from '../src/capture/model';
 import { json, sha256 } from '../src/encoding';
 import type { Recipe } from '../src/capture/recipe';
-import { checkKinds } from '../src/checks';
+import { checkKinds, type CheckDefinition } from '../src/checks';
 import { evidenceKinds, type EvidenceValue } from '../src/evidence-kinds';
 import {
   fixtureHash,
@@ -32,6 +32,7 @@ import { defineCheck, perSide, type CheckInput } from '../src/checks/define';
 import {
   compareJourney,
   evaluateCheck,
+  inspectComparison,
   inspectJourney,
   inspectSide,
   summarizeJourneys,
@@ -39,10 +40,13 @@ import {
 import {
   comparisonSchema,
   journeySchema,
+  type Comparison,
   type Journey,
+  type RecipeSources,
   type Selection,
   type Visual,
 } from '../src/comparison-model';
+import { recipeLines } from '../src/change-scope-text';
 import { renderComparison } from '../src/comparison-report';
 import { exportComparison } from '../src/export';
 import { encodeRgbPng } from '../src/png';
@@ -50,6 +54,8 @@ import { serveReport } from '../src/view';
 import { checkRows } from '../scripts/github-action';
 import { resultCounts } from '../src/result-text';
 import { collectReport } from '../src/playwright/collect';
+import type { Journey as ProjectJourney } from '../src/project';
+import { recipePlan, type JourneyJudgement } from '../src/recipe-diff';
 import { parseJsonReport } from '../src/playwright/report';
 
 const evaluatedAt = '2026-09-23T12:00:00.000Z';
@@ -2250,6 +2256,7 @@ async function playwrightJourney(options: {
   base: EvidenceValue<'playwright'>['tests'][number][];
   candidate: EvidenceValue<'playwright'>['tests'][number][];
   candidateSpec?: string;
+  judgement?: JourneyJudgement;
 }) {
   const base = await syntheticBundle({
     contract: withPlaywright,
@@ -2267,6 +2274,9 @@ async function playwrightJourney(options: {
     base: await inspect(base.directory),
     candidate: await inspect(candidate.directory),
     evaluatedAt,
+    ...(options.judgement === undefined
+      ? {}
+      : { judgement: options.judgement }),
   });
 }
 
@@ -2284,10 +2294,11 @@ test('an imported test that passed on base and fails with the same test file is 
       scope: 'Imported from Playwright: cart.spec.ts:3, project chromium.',
     }),
   ]);
+  expect(result.checks[0]?.recipe).toBeUndefined();
   expect(result.conclusion.kind).toBe('regression');
 });
 
-test('a failing imported test whose file changed is failed, not a regression', async () => {
+test('an imported test whose file changed carries the label, and its failure is not a regression', async () => {
   const result = await playwrightJourney({
     base: [playwrightTest('adds an item', 'expected')],
     candidate: [playwrightTest('adds an item', 'unexpected')],
@@ -2299,6 +2310,20 @@ test('a failing imported test whose file changed is failed, not a regression', a
   expect(result.checks[0]?.detail).toMatch(
     /e2e\/cart\.spec\.ts changed between base and candidate, so a regression is not established\.$/,
   );
+  expect(result.checks[0]?.recipe).toEqual({ change: 'test-file-changed' });
+
+  const passing = await playwrightJourney({
+    base: [playwrightTest('adds an item', 'expected')],
+    candidate: [playwrightTest('adds an item', 'expected')],
+    candidateSpec: 'test("adds two items")\n',
+  });
+
+  expect(passing.checks).toEqual([
+    expect.objectContaining({
+      verdict: 'passed',
+      recipe: { change: 'test-file-changed' },
+    }),
+  ]);
 });
 
 test('a test the candidate adds keeps the captures comparable, and a flaky one is unknown', async () => {
@@ -2633,4 +2658,454 @@ test('a source map built from other code than the snapshot gives no line', async
     reason:
       "The source map's copy of src/app.js differs from the snapshot; no frame function is defined on an added line",
   });
+});
+
+function projectJourney(
+  checks: readonly CheckDefinition[],
+  fields: Partial<ProjectJourney> = {},
+): ProjectJourney {
+  return {
+    name: recipe.name,
+    path: recipe.path,
+    ready: recipe.ready,
+    steps: recipe.steps,
+    checks,
+    viewport: recipe.viewport,
+    browserArguments: recipe.browserArguments,
+    maxAgeMs: recipe.maxAgeMs,
+    ...fields,
+  };
+}
+
+const allowsTwo = { ...requestCheck, expectedCount: 2 };
+
+async function judgedSides(options: {
+  captured: readonly CheckDefinition[];
+  baseCount: number;
+  candidateCount: number;
+}) {
+  const contract = { ...recipe, checks: options.captured };
+  const base = await syntheticBundle({ count: options.baseCount, contract });
+  const candidate = await syntheticBundle({
+    count: options.candidateCount,
+    contract,
+  });
+
+  return { base, candidate };
+}
+
+async function judged(options: {
+  base: readonly CheckDefinition[] | 'unusable' | 'unreadable';
+  captured: readonly CheckDefinition[];
+  baseCount: number;
+  candidateCount: number;
+  baseFields?: Partial<ProjectJourney>;
+}) {
+  const bundles = await judgedSides(options);
+  const sources: Record<'unreadable' | 'unusable', RecipeSources['base']> = {
+    unreadable: { kind: 'unavailable', reason: 'Git failed.' },
+    unusable: {
+      kind: 'unusable',
+      commit: 'c'.repeat(40),
+      reason: 'The base revision has no observed.json.',
+    },
+  };
+  const plan = recipePlan(
+    {
+      base:
+        typeof options.base === 'string'
+          ? sources[options.base]
+          : {
+              kind: 'read',
+              commit: 'c'.repeat(40),
+              sha256: 'd'.repeat(64),
+              journeys: [projectJourney(options.base, options.baseFields)],
+            },
+      candidate: [projectJourney(options.captured)],
+    },
+    'unused',
+  );
+
+  const result = single(
+    compareJourney({
+      base: await Effect.runPromise(
+        inspectSide({
+          directory: bundles.base.directory,
+          prefix: 'base',
+          evaluatedAt,
+        }),
+      ),
+      candidate: await inspect(bundles.candidate.directory),
+      evaluatedAt,
+      visual: pixelsNotInspected,
+      judgement: plan.judge(recipe.name),
+    }),
+  );
+
+  return result.changeScope.kind === 'recorded'
+    ? {
+        ...result,
+        changeScope: { ...result.changeScope, recipe: plan.scope },
+      }
+    : result;
+}
+
+async function selectedComparison(
+  bundles: Awaited<ReturnType<typeof judgedSides>>,
+  recipes: Selection['recipes'],
+) {
+  const root = await mkdtemp(path.join(tmpdir(), 'observed-recipe-'));
+  directories.push(root);
+  await mkdir(path.join(root, 'journey-1'));
+  await symlink(bundles.base.directory, path.join(root, 'journey-1/base'));
+  await symlink(
+    bundles.candidate.directory,
+    path.join(root, 'journey-1/candidate'),
+  );
+
+  const { result } = await Effect.runPromise(
+    inspectComparison({
+      root,
+      selection: {
+        schemaVersion: 2,
+        evaluatedAt,
+        mode: 'comparison',
+        journeys: [{ directory: 'journey-1', base: null, candidate: null }],
+        ...(recipes === undefined ? {} : { recipes }),
+      },
+    }),
+  );
+
+  return Schema.decodeUnknownSync(comparisonSchema)(JSON.parse(json(result)));
+}
+
+test('a raised expectation is judged by the base, and the proposal sets no verdict', async () => {
+  // A duplicate request ships with expectedCount raised from 1 to 2.
+  const bundles = await judgedSides({
+    captured: [allowsTwo],
+    baseCount: 1,
+    candidateCount: 2,
+  });
+  const result = await selectedComparison(bundles, {
+    base: {
+      kind: 'read',
+      commit: 'c'.repeat(40),
+      sha256: 'd'.repeat(64),
+      journeys: [projectJourney([requestCheck])],
+    },
+    candidate: [projectJourney([allowsTwo])],
+  });
+  const [journey] = result.journeys;
+
+  expect(journey?.checks).toMatchObject([
+    {
+      id: requestCheck.id,
+      verdict: 'regression',
+      expectation: 'Exactly 1 GET /api/items request(s) with status 200.',
+      recipe: {
+        change: 'altered',
+        proposed: {
+          expectation: 'Exactly 2 GET /api/items request(s) with status 200.',
+          outcome: 'passed',
+        },
+      },
+    },
+  ]);
+  expect(result.conclusion.kind).toBe('regression');
+  expect(result.conclusion.text).toContain(
+    "The candidate's proposed version passed and sets no verdict.",
+  );
+  expect(journey?.base.checks).toEqual([
+    expect.objectContaining({ outcome: 'passed', actual: 1 }),
+  ]);
+  expect(journey?.comparison).toMatchObject({ kind: 'available' });
+  expect(
+    journey?.comparison.kind === 'available' && journey.comparison.basis,
+  ).toContain("The base's observed.json defines this journey differently.");
+  expect(result.changeScope).toMatchObject({
+    kind: 'recorded',
+    recipe: {
+      kind: 'changed',
+      differences: [
+        {
+          check: requestCheck.id,
+          change: 'altered',
+          fields: [{ field: 'expectedCount', base: 1, candidate: 2 }],
+        },
+      ],
+    },
+  });
+
+  // Without the base file, the captured definition judges both sides.
+  const uncompared = await selectedComparison(bundles, undefined);
+
+  expect(uncompared.conclusion.kind).toBe('no-regression');
+  expect(uncompared.changeScope).toMatchObject({
+    recipe: { kind: 'unavailable' },
+  });
+});
+
+test('an altered check without a verdict label shows no base expectation', async () => {
+  // A candidate capture that did not complete gives verdicts without labels.
+  const result = await judged({
+    base: [requestCheck],
+    captured: [allowsTwo],
+    baseCount: 1,
+    candidateCount: 2,
+  });
+  const [journey] = result.journeys;
+  const unlabeled = {
+    ...result,
+    journeys: [
+      {
+        ...journey,
+        checks: journey.checks.map(
+          ({ id, name, scope, expectation, verdict, detail }) => ({
+            id,
+            name,
+            scope,
+            expectation,
+            verdict,
+            detail,
+          }),
+        ),
+      },
+    ],
+  } satisfies Comparison;
+
+  expect(recipeLines(result).join(' ')).toContain('Base expectation');
+  expect(recipeLines(unlabeled)).toEqual([
+    'Altered by this change: One request per load action. Regression.',
+  ]);
+});
+
+test('an altered check that the candidate meets under the base definition passes', async () => {
+  const renamed = {
+    ...requestCheck,
+    name: 'Each Load items click sends one request',
+  };
+  const result = await judged({
+    base: [requestCheck],
+    captured: [renamed],
+    baseCount: 1,
+    candidateCount: 1,
+  });
+
+  expect(result.conclusion.kind).toBe('no-regression');
+  expect(result.journeys[0].checks).toMatchObject([
+    {
+      name: requestCheck.name,
+      verdict: 'passed',
+      recipe: {
+        change: 'altered',
+        proposed: { outcome: 'passed' },
+      },
+    },
+  ]);
+});
+
+test('a removed check still reports its verdict under the base definition', async () => {
+  const result = await judged({
+    base: [requestCheck],
+    captured: [],
+    baseCount: 1,
+    candidateCount: 2,
+  });
+
+  expect(result.journeys[0].checks).toMatchObject([
+    {
+      id: requestCheck.id,
+      verdict: 'regression',
+      recipe: { change: 'removed' },
+    },
+  ]);
+  expect(result.conclusion.kind).toBe('regression');
+  expect(result.summary).toEqual({ passed: 0, total: 1 });
+});
+
+test('an added check has no baseline, so a failure is not a regression', async () => {
+  for (const base of [[], 'unusable'] as const) {
+    const result = await judged({
+      base,
+      captured: [requestCheck],
+      baseCount: 1,
+      candidateCount: 2,
+    });
+    const [journey] = result.journeys;
+
+    expect(journey.checks).toEqual([
+      expect.objectContaining({
+        verdict: 'failed',
+        recipe: { change: 'added' },
+      }),
+    ]);
+    expect(result.conclusion.kind).toBe('check-failed');
+    expect(journey.base.checks).toEqual([]);
+  }
+});
+
+test('altered journey steps leave every check in the journey unknown', async () => {
+  const result = await judged({
+    base: [requestCheck],
+    captured: [requestCheck],
+    baseCount: 1,
+    candidateCount: 1,
+    baseFields: { steps: [{ kind: 'network-idle' }] },
+  });
+
+  expect(result.journeys[0].checks).toMatchObject([
+    {
+      verdict: 'unknown',
+      recipe: {
+        change: 'journey-altered',
+        fields: ['steps'],
+        proposed: { outcome: 'passed' },
+      },
+    },
+  ]);
+  expect(result.conclusion.kind).toBe('unavailable');
+});
+
+test('a removed journey leaves its checks unknown and the run unavailable', async () => {
+  const bundles = await judgedSides({
+    captured: [requestCheck],
+    baseCount: 1,
+    candidateCount: 1,
+  });
+  const result = await selectedComparison(bundles, {
+    base: {
+      kind: 'read',
+      commit: 'c'.repeat(40),
+      sha256: 'd'.repeat(64),
+      journeys: [
+        projectJourney([requestCheck]),
+        projectJourney([requestCheck], { name: 'Reload items' }),
+      ],
+    },
+    candidate: [projectJourney([requestCheck])],
+  });
+
+  expect(result.removedJourneys).toEqual([
+    {
+      journey: 'Reload items',
+      checks: [
+        expect.objectContaining({
+          id: requestCheck.id,
+          verdict: 'unknown',
+          recipe: { change: 'removed' },
+        }),
+      ],
+    },
+  ]);
+  expect(result.journeys[0].checks).toEqual([
+    expect.objectContaining({ verdict: 'passed' }),
+  ]);
+  expect(result.summary).toEqual({ passed: 1, total: 2 });
+  expect(result.conclusion.kind).toBe('unavailable');
+  expect(result.conclusion.text).toContain(
+    'Reload items: this change removes the journey, so no capture ran its checks.',
+  );
+});
+
+test('an unreadable base file leaves every check unknown, never judged by the candidate', async () => {
+  const result = await judged({
+    base: 'unreadable',
+    captured: [allowsTwo],
+    baseCount: 1,
+    candidateCount: 2,
+  });
+
+  expect(result.journeys[0].checks).toMatchObject([{ verdict: 'unknown' }]);
+  expect(result.journeys[0].checks[0]?.detail).toContain('Git failed.');
+  expect(result.conclusion.kind).toBe('unavailable');
+});
+
+test('imported tests in a journey whose collectors changed are unknown', async () => {
+  const playwright = (command: readonly [string, ...string[]]) => ({
+    collectors: [{ kind: 'playwright' as const, command }],
+  });
+  const plan = recipePlan(
+    {
+      base: {
+        kind: 'read',
+        commit: 'c'.repeat(40),
+        sha256: 'd'.repeat(64),
+        journeys: [
+          projectJourney([], playwright(['npx', 'playwright', 'test'])),
+        ],
+      },
+      candidate: [
+        projectJourney(
+          [],
+          playwright([
+            'npx',
+            'playwright',
+            'test',
+            '--grep-invert',
+            'checkout',
+          ]),
+        ),
+      ],
+    },
+    'unused',
+  );
+  const result = await playwrightJourney({
+    base: [playwrightTest('adds an item', 'expected')],
+    candidate: [playwrightTest('adds an item', 'expected')],
+    judgement: plan.judge(recipe.name),
+  });
+
+  expect(result.checks).toMatchObject([
+    {
+      verdict: 'unknown',
+      recipe: {
+        change: 'journey-altered',
+        fields: ['collectors'],
+        proposed: { outcome: 'passed' },
+      },
+    },
+  ]);
+  expect(result.conclusion.kind).toBe('unavailable');
+});
+
+test('imported tests are unknown when the base file could not be read', async () => {
+  const result = await playwrightJourney({
+    base: [playwrightTest('adds an item', 'expected')],
+    candidate: [playwrightTest('adds an item', 'expected')],
+    judgement: { kind: 'unreadable', reason: 'Git failed.' },
+  });
+
+  expect(result.checks).toMatchObject([{ verdict: 'unknown' }]);
+  expect(result.checks[0]?.detail).toContain('Git failed.');
+});
+
+test('a removed journey that ran Playwright leaves an unknown imported run', async () => {
+  const bundles = await judgedSides({
+    captured: [requestCheck],
+    baseCount: 1,
+    candidateCount: 1,
+  });
+  const result = await selectedComparison(bundles, {
+    base: {
+      kind: 'read',
+      commit: 'c'.repeat(40),
+      sha256: 'd'.repeat(64),
+      journeys: [
+        projectJourney([requestCheck]),
+        projectJourney([], {
+          name: 'Run end-to-end tests',
+          collectors: withPlaywright.collectors,
+        }),
+      ],
+    },
+    candidate: [projectJourney([requestCheck])],
+  });
+
+  expect(result.removedJourneys).toMatchObject([
+    {
+      journey: 'Run end-to-end tests',
+      checks: [{ id: 'playwright-run', verdict: 'unknown' }],
+    },
+  ]);
+  expect(result.conclusion.kind).toBe('unavailable');
 });

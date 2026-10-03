@@ -22,7 +22,7 @@ export const relativePathSchema = text.check(
 
 export const commandSchema = Schema.NonEmptyArray(text);
 
-const journeySchema = Schema.Struct({
+export const journeySchema = Schema.Struct({
   name: text,
   path: routeSchema,
   ready: Schema.Array(stepSchema),
@@ -79,7 +79,12 @@ export type Project = typeof projectSchema.Type;
 
 export class ProjectFailure extends Schema.TaggedError<ProjectFailure>()(
   'ProjectFailure',
-  { message: Schema.String },
+  {
+    message: Schema.String,
+    problem: Schema.optionalKey(
+      Schema.Literals(['json', 'credentials', 'contract', 'journey']),
+    ),
+  },
 ) {}
 
 export const loadProject = Effect.fn('loadProject')(function* (
@@ -95,13 +100,26 @@ export const loadProject = Effect.fn('loadProject')(function* (
     });
   }
 
+  const { project, journeys, recipes } = yield* parseProject(
+    yield* fs.readFileString(filename),
+    filename,
+  );
+
+  return { root, project, journeys, recipes };
+});
+
+export const parseProject = Effect.fnUntraced(function* (
+  content: string,
+  filename: string,
+) {
   const input = yield* Schema.decodeUnknownEffect(
     Schema.fromJsonString(Schema.Unknown),
-  )(yield* fs.readFileString(filename)).pipe(
+  )(content).pipe(
     Effect.mapError(
       () =>
         new ProjectFailure({
           message: 'observed.json must contain valid JSON',
+          problem: 'json',
         }),
     ),
   );
@@ -110,6 +128,7 @@ export const loadProject = Effect.fn('loadProject')(function* (
     return yield* new ProjectFailure({
       message:
         'observed.json contains credentials. Use disposable inputs without credentials for exported captures.',
+      problem: 'credentials',
     });
   }
 
@@ -121,19 +140,27 @@ export const loadProject = Effect.fn('loadProject')(function* (
       (error) =>
         new ProjectFailure({
           message: `${filename} does not match the project contract:\n${error.message}`,
+          problem: 'contract',
         }),
     ),
   );
 
-  const journeys = project.journeys ?? [
+  const [firstJourney, ...otherJourneys] = project.journeys ?? [
     project.capture ?? (yield* Effect.die('Project has no journey')),
   ];
+
+  if (firstJourney === undefined) {
+    return yield* Effect.die('Project has no journey');
+  }
+
+  const journeys = [firstJourney, ...otherJourneys] as const;
   const recipes = yield* Effect.forEach(journeys, (journey) =>
     Schema.decodeUnknownEffect(recipeSchema)(journeyRecipe(journey)).pipe(
       Effect.mapError(
         (error) =>
           new ProjectFailure({
             message: `${filename}: journey ${JSON.stringify(journey.name)} is inconsistent:\n${error.message}`,
+            problem: 'journey',
           }),
       ),
     ),
@@ -144,20 +171,33 @@ export const loadProject = Effect.fn('loadProject')(function* (
     return yield* Effect.die('Project has no journey');
   }
 
-  return { root, project, recipes: [first, ...rest] as const };
+  return { project, journeys, recipes: [first, ...rest] as const };
 });
 
-function journeyRecipe({ check, checks, collectors, ...journey }: Journey) {
-  const configured = checks ?? (check === undefined ? [] : [check]);
+export const defaultViewport = { width: 1280, height: 800, scale: 1 };
+export const defaultMaxAgeMs = 86_400_000;
+
+export function journeyChecks({
+  check,
+  checks,
+}: {
+  check?: Journey['check'] | undefined;
+  checks?: Journey['checks'] | undefined;
+}) {
+  return checks ?? (check === undefined ? [] : [check]);
+}
+
+function journeyRecipe({ check, checks, collectors, ...fields }: Journey) {
+  const configured = journeyChecks({ check, checks });
 
   return {
     schemaVersion: recipeSchemaVersion,
-    id: journey.name,
-    ...journey,
+    id: fields.name,
+    ...fields,
     checks: configured,
     collectors: journeyCollectors(configured, collectors ?? []),
-    viewport: journey.viewport ?? { width: 1280, height: 800, scale: 1 },
-    browserArguments: journey.browserArguments ?? [],
-    maxAgeMs: journey.maxAgeMs ?? 86_400_000,
+    viewport: fields.viewport ?? defaultViewport,
+    browserArguments: fields.browserArguments ?? [],
+    maxAgeMs: fields.maxAgeMs ?? defaultMaxAgeMs,
   };
 }
