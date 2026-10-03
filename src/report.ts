@@ -83,7 +83,7 @@ function renderArtifact(result: ArtifactResult, link: string): string {
     const label =
       result.integrity === 'matched'
         ? 'matched supplied hash'
-        : 'computed; no supplied hash to verify';
+        : 'computed; no supplied hash to compare';
 
     integrity = `SHA-256 ${label}: \`${result.hash}\``;
   }
@@ -169,7 +169,7 @@ export function renderReport(
 
 ${passed} imported passed; ${failed} imported failed; ${incomplete.length} unknown checks.
 
-Behavior was not independently verified by Observed. Change comparison and regression interpretation are unavailable in this Phase 0 report.
+Observed did not run these checks. It imported their results. Change comparison and regression interpretation are unavailable in this Phase 0 report.
 
 Observed computed artifact availability and SHA-256 integrity only: ${artifacts.length - unavailable} available; ${unavailable} unavailable. Schema version 1 validated.
 

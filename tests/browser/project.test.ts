@@ -95,6 +95,12 @@ async function copyProject(name: keyof typeof projects, label: string) {
       !['node_modules', 'dist'].includes(path.basename(source)),
   });
   await command(['git', 'init', '--quiet'], directory);
+  await commitAll(directory, 'Test baseline');
+
+  return directory;
+}
+
+async function commitAll(directory: string, message: string) {
   await command(['git', 'add', '.'], directory);
   await command(
     [
@@ -108,12 +114,10 @@ async function copyProject(name: keyof typeof projects, label: string) {
       'commit',
       '--quiet',
       '-m',
-      'Test baseline',
+      message,
     ],
     directory,
   );
-
-  return directory;
 }
 
 async function observe(
@@ -189,8 +193,9 @@ async function rawCapture(
         ),
       )(line),
     );
+  // The server also answers the coverage session's repeat of the journey.
   expect(ledger).toEqual(
-    Array.from({ length: count }, () => ({ method, path: endpoint })),
+    Array.from({ length: count * 2 }, () => ({ method, path: endpoint })),
   );
   const manifest = await readJson(
     path.join(directory, 'capture.json'),
@@ -387,7 +392,7 @@ async function viewer(
             'eval',
             '-b',
             Buffer.from(
-              '({images: document.querySelectorAll("#screenshots a img").length, text: document.querySelector("#report").innerText, detailsOpen: document.querySelector("#checks").open, height: innerHeight, leadTop: document.querySelector("#report details[open]").getBoundingClientRect().top})',
+              '({images: document.querySelectorAll("#screenshots a img").length, text: document.querySelector("#report").innerText, detailsOpen: document.querySelector("#checks").open, height: innerHeight, leadTop: (document.querySelector("#change-map-title") ?? document.querySelector("#report details[open]")).getBoundingClientRect().top})',
             ).toString('base64'),
           );
           const viewed = Schema.decodeUnknownSync(
@@ -650,8 +655,12 @@ test('previews a non-React app without checks and then applies its own POST expe
     1,
   );
   expect(missing.result.journeys[0].comparison.kind).toBe('unavailable');
+  // Without the base's observed.json, no definition can judge the check.
   expect(missing.result.journeys[0].candidate.checks[0]?.outcome).toBe(
-    'passed',
+    'unknown',
+  );
+  expect(missing.result.journeys[0].candidate.checks[0]?.detail).toContain(
+    "The base revision's observed.json could not be read",
   );
   expect(missing.result.journeys[0].base.unresolved.join(' ')).toContain(
     'no-such-revision',
@@ -687,7 +696,6 @@ test('a seeded thrown error fails browser-errors as a regression and matches the
 `,
   );
   expect(seeded).not.toBe(app);
-  await writeFile(path.join(project, 'app.ts'), seeded);
   await writeFile(
     path.join(project, 'observed.json'),
     json({
@@ -703,6 +711,9 @@ test('a seeded thrown error fails browser-errors as a regression and matches the
       },
     }),
   );
+  // The base defines the check, so its definition judges both captures.
+  await commitAll(project, 'Check browser errors');
+  await writeFile(path.join(project, 'app.ts'), seeded);
 
   const compared = await observe(
     project,
@@ -940,7 +951,8 @@ test.each([
     const fills = (await transcript(capture)).filter(
       (record) => record.args.at(-2) === 'batch',
     );
-    expect(fills).toHaveLength(1);
+    // The coverage session repeats the fill only when the journey completed.
+    expect(fills).toHaveLength(exit === 0 ? 2 : 1);
 
     if (exit === 0) {
       expect(result.result.journeys[0].candidate.checks[0]?.outcome).toBe(
@@ -1189,7 +1201,8 @@ test('additional origins preserve previews and keep same-path request checks sep
       await cleanup(path.join(result.directory, 'journey-1', 'candidate'));
     }
 
-    expect(requests).toEqual(Array.from({ length: 4 }, () => 'POST /orders'));
+    // Four runs, and a coverage repeat in each of the three that completed.
+    expect(requests).toEqual(Array.from({ length: 7 }, () => 'POST /orders'));
   } finally {
     await backend.stop(true);
   }

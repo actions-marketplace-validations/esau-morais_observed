@@ -14,21 +14,24 @@ import {
   shortSource,
 } from '../provenance-text';
 import {
-  checkLabels,
   anchorLocation,
   conclusionLabels,
   conclusionTones,
+  runTone,
   describeMeasure,
   executionLabels,
   headlineParts,
   resultCounts,
+  sideOutcome,
   toneSymbols,
   verdictLabels,
   verdictTones,
   type Tone,
 } from '../result-text';
+import { statusWords } from '../status-words';
 import { describeVisual, diffLegend } from '../visual-text';
 import { AgentCopy } from './agent-copy';
+import { ChangeScopeView } from './change-map';
 import { fonts, geometry, media } from './constants.stylex';
 import {
   Artifacts,
@@ -430,10 +433,10 @@ const sectionSymbols = {
 } satisfies Record<SectionStatus, string>;
 
 const sectionStatusLabels = {
-  failed: 'Failed',
-  unknown: 'Unknown',
-  changed: 'Changed',
-  passed: 'Passed',
+  failed: statusWords.failed.word,
+  unknown: statusWords.unknown.word,
+  changed: statusWords.changed.word,
+  passed: statusWords.passed.word,
   neutral: '',
 } satisfies Record<SectionStatus, string>;
 
@@ -570,18 +573,6 @@ function SectionChecks({
   );
 }
 
-function sideOutcome(side: Side, id: string): string {
-  const check = side.checks.find((item) => item.id === id);
-
-  if (check === undefined) {
-    return 'not configured';
-  }
-
-  return check.actual === null
-    ? checkLabels[check.outcome]
-    : `${checkLabels[check.outcome]}, actual ${check.actual}`;
-}
-
 function ChecksList({
   journey,
   outline,
@@ -596,8 +587,8 @@ function ChecksList({
   if (journey.checks.length === 0) {
     return (
       <p {...stylex.props(styles.text)}>
-        No named check is configured, so nothing was verified. The captures show
-        the application only.
+        No named check is configured, so no behavior was checked. The captures
+        show the application only.
       </p>
     );
   }
@@ -1219,6 +1210,7 @@ function SectionBody({
     case 'browser-errors':
     case 'api':
     case 'playwright':
+    case 'coverage':
       return (
         <>
           <SectionChecks
@@ -1422,9 +1414,9 @@ function JourneyView({
 }
 
 function Verdict({ result }: { result: Comparison }) {
-  const tone = conclusionTones[result.conclusion.kind];
+  const tone = runTone(result);
   const multiple = result.journeys.length > 1;
-  const { subject, restated } = headlineParts(result);
+  const { label, subject, restated } = headlineParts(result);
   const unresolved = groupUnresolved(result);
   const [first] = result.journeys;
   const source = (side: Side) =>
@@ -1438,7 +1430,7 @@ function Verdict({ result }: { result: Comparison }) {
         <span aria-hidden="true" {...stylex.props(styles.symbol)}>
           {toneSymbols[tone]}
         </span>
-        {conclusionLabels[result.conclusion.kind]}
+        {label}
       </p>
       <h1 id="report-title" {...stylex.props(styles.title)}>
         {result.title}
@@ -1449,7 +1441,7 @@ function Verdict({ result }: { result: Comparison }) {
       <p {...stylex.props(styles.lead)}>{result.conclusion.text}</p>
       <p {...stylex.props(styles.text)}>
         {result.summary.total === 0
-          ? 'No named checks configured, so nothing was verified.'
+          ? 'No named check is configured, so no behavior was checked.'
           : resultCounts(result)}
       </p>
       {first === undefined || multiple ? null : (
@@ -1520,6 +1512,10 @@ export function ComparisonReport({ result }: { result: Comparison }) {
             </details>
           </div>
           <div {...stylex.props(styles.bodyArea)}>
+            {result.mode === 'comparison' &&
+            result.changeScope.kind === 'recorded' ? (
+              <ChangeScopeView result={result} scope={result.changeScope} />
+            ) : null}
             {result.journeys.map((journey, index) => {
               const outline = outlines[index];
 

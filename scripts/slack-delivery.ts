@@ -1,4 +1,5 @@
 import { Option, Schema } from 'effect';
+import { scopeLine } from '../src/change-scope-text';
 import type {
   CheckVerdict,
   Comparison,
@@ -9,7 +10,7 @@ import { decodePng, encodeRgbPng } from '../src/png';
 import { shortSource } from '../src/provenance-text';
 import {
   anchorLocation,
-  conclusionTones,
+  runTone,
   executionLabels,
   headline,
   leadingChecks,
@@ -92,17 +93,50 @@ function checkCount(result: Comparison): string {
   switch (result.conclusion.kind) {
     case 'regression':
     case 'check-failed': {
-      const unknown = count(['unknown', 'not-run']);
+      const unknown = count(['unknown']);
+      const notRun = count(['not-run']);
 
-      return `${count(['regression', 'failed'])} of ${total} ${noun} failed${unknown === 0 ? '' : `, ${unknown} unknown`}`;
+      return `${count(['regression', 'failed'])} of ${total} ${noun} failed${unknown === 0 ? '' : `, ${unknown} unknown`}${notRun === 0 ? '' : `, ${notRun} not run`}`;
     }
-    case 'unavailable':
-      return `${count(['unknown', 'not-run'])} of ${total} ${noun} unknown`;
+    case 'unavailable': {
+      const unknown = count(['unknown']);
+      const notRun = count(['not-run']);
+
+      return unknown === 0
+        ? `${notRun} of ${total} ${noun} not run`
+        : `${unknown} of ${total} ${noun} unknown${notRun === 0 ? '' : `, ${notRun} not run`}`;
+    }
     case 'no-regression':
     case 'not-checked':
     case 'preview':
       return `${count(['passed'])} of ${total} ${noun} passed`;
   }
+}
+
+// Paths only: a file's reason can quote coverage tool output.
+function scopeText(result: Comparison): string[] {
+  const scope = result.changeScope;
+
+  if (result.mode === 'preview') {
+    return [];
+  }
+
+  const paths =
+    scope.kind === 'recorded'
+      ? scope.files.flatMap((file) =>
+          file.relation === 'not-observed' ? [file.path] : [],
+        )
+      : [];
+  const shown = paths
+    .slice(0, 5)
+    .map((path) => `\`${slackText(path)}\``)
+    .join(', ');
+  const more = paths.length > 5 ? ` and ${paths.length - 5} more` : '';
+
+  return [
+    slackText(scopeLine(scope)),
+    ...(paths.length === 0 ? [] : [`Not observed: ${shown}${more}`]),
+  ];
 }
 
 function button(text: string, url: string | null, id: string) {
@@ -139,10 +173,7 @@ export function slackMessage(result: Comparison | null, links: SlackLinks) {
       : headline(result),
     300,
   );
-  const icon =
-    result === null
-      ? icons.unknown
-      : icons[conclusionTones[result.conclusion.kind]];
+  const icon = result === null ? icons.unknown : icons[runTone(result)];
   const where =
     slackLink(links.pullRequestLabel, links.pullRequest) ??
     slackText(links.pullRequestLabel);
@@ -178,7 +209,15 @@ export function slackMessage(result: Comparison | null, links: SlackLinks) {
       },
       {
         type: 'context',
-        elements: [{ type: 'mrkdwn', text: context.join(' · ') }],
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: [
+              context.join(' · '),
+              ...(result === null ? [] : scopeText(result)),
+            ].join('\n'),
+          },
+        ],
       },
       ...(buttons.length === 0 ? [] : [{ type: 'actions', elements: buttons }]),
     ],
@@ -193,10 +232,7 @@ export function slackRecovery(result: Comparison | null) {
     result === null
       ? 'No result: treat this run as unavailable'
       : headline(result);
-  const icon =
-    result === null
-      ? icons.unknown
-      : icons[conclusionTones[result.conclusion.kind]];
+  const icon = result === null ? icons.unknown : icons[runTone(result)];
 
   return {
     text: `${icon} *${slackText(clip(title, 300))}* at ${revision(head)}${result === null ? '' : ` · ${checkCount(result)}`}`,

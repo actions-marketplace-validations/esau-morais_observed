@@ -39,9 +39,9 @@ The full commit SHA pins the action to one release, and the comment beside it
 names the tag. The action installs `@observed-software/cli` at the same
 version. To upgrade, use the commit of a newer
 [release](https://github.com/esau-morais/observed/releases) tag, or let
-Dependabot's `github-actions` updates propose it. `@v0` follows the latest stable 0.x release, currently 0.1.0, which lacks
-inputs such as `github-token` and `slack-images` and posts only through a
-GitHub App. A tag can move, so prefer the SHA.
+Dependabot's `github-actions` updates propose it. `@v0` follows the latest
+stable 0.x release and can move, so pin a SHA. 0.1.0 lacks inputs such as
+`github-token` and `slack-images` and posts only through a GitHub App.
 
 `uses:` works for any public repository. The GitHub Marketplace listing is
 only for finding the action.
@@ -101,7 +101,7 @@ passes. Add a check to `observed.json` before you require the job.
 | Place | Content |
 | --- | --- |
 | Check title | The verdict line, such as `Regression: Median LCP 52 ms → 452 ms, at most 250 ms` |
-| Job summary and comment | The verdict and the values that decided it, one line per failing or unknown check, a count of the rest, why a capture failed, and the base and head commits |
+| Job summary and comment | The verdict and the values that decided it, one line per failing or unknown check, a count of the rest, why a capture failed, the change scope with up to 10 changed files and their relations, each check that `observed.json` adds, removes or alters, and the base and head commits |
 | Prompt for your agent | A copyable prompt built from the result: values, commits, evidence and artifact paths, and the reminder that a changed value is not a regression by itself |
 | Hidden `<!-- observed:agent -->` block | The result schema version, commits, artifact name and `result.json` paths |
 | Open the report | `observed-bundle.html`, the same report as `observed view`, in one file |

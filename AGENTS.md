@@ -22,7 +22,7 @@ Observed compares software changes using runtime evidence. Its core must work wi
 | Tests | Vitest for runtime contracts. Existing browser journeys and agent-browser for real application checks |
 | Evidence | Versioned JSON manifests and artifact files. Add SQLite when history or queue requirements justify it |
 | Capture | A thin agent-browser adapter first. Keep producer-specific details outside the comparator |
-| Distribution | One npm package, `@observed-software/cli`, holding the bundled CLI, action script, and built viewer. No install scripts; runtime dependencies stay limited to agent-browser. The tag-driven release workflow runs the npm CLI only for `npm publish`, because Bun cannot publish with provenance or trusted publishing. Contributors never install with npm. A standalone `bun build --compile` binary measured 62 to 82 MB per platform before agent-browser and is deferred until a participant cannot install Bun |
+| Distribution | One npm package, `@observed-software/cli`, holding the bundled CLI, action script, and built viewer. No install scripts; runtime dependencies stay limited to agent-browser. The tag-driven release workflow installs a pinned npm CLI and runs it only to publish and to read and move dist-tags, because Bun cannot do either through trusted publishing. Contributors never install with npm. A standalone `bun build --compile` binary measured 62 to 82 MB per platform before agent-browser and is deferred until a participant cannot install Bun |
 
 Pin compatible versions during application setup. Stack changes need an explicit request or a documented decision accepted by the maintainer. Routine dependency fixes within this stack need no new approval.
 
@@ -105,7 +105,7 @@ Edit canonical files in `.agents/skills`. `.claude/skills` points there. Do not 
 
 ## Finish the task
 
-Keep changes scoped and preserve unrelated work. Use implementation branches and focused commits in a connected repository. Apply [babysit-pr](.agents/skills/babysit-pr/SKILL.md) automatically for implementation and workflow changes, including review and feedback handling. Publishing, deploying, merging, messages, and destructive operations require task authorization. Reuse authorization already given. Releases are the exception: decide and cut them under [babysit-pr](.agents/skills/babysit-pr/SKILL.md#decide-on-a-release) without waiting to be asked.
+Keep changes scoped and preserve unrelated work. Use implementation branches and focused commits in a connected repository. Apply [babysit-pr](.agents/skills/babysit-pr/SKILL.md) automatically for implementation and workflow changes, including review and feedback handling. Publishing, deploying, merging, messages, and destructive operations require task authorization. Reuse authorization already given. A change to AGENTS.md, skills, branch protection, or required checks needs the maintainer's approval of the reviewed change before merge, in a message or review that names the PR; a request for the change or merge authorization alone does not cover it. Releases are the exception: decide and cut them under [babysit-pr](.agents/skills/babysit-pr/SKILL.md#decide-on-a-release) without waiting to be asked.
 
 Report what changed, checks run, their results, and what remains unverified. Include evidence locations when available. A plan, generated screenshot, or unexecuted test is not completed verification.
 

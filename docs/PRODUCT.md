@@ -52,13 +52,15 @@ Connecting another application requires no edits to Observed.
 | React, optional | Relevant subtree, render changes, source references | Instrumentation does not reveal all data flow |
 | API operations | Status, schema match, readback | Only the specified operation and controlled data |
 | Imported tests | Each Playwright test as a check | Observed did not run the assertions |
+| Phase 3a: replay | Base and candidate recordings side by side, with step captions from the action timeline | One recorded run. Not timing evidence |
 | Later: database, jobs, traces | Fixture readback, event sequence, linked spans | Schedules and traces do not prove causation |
 | Later: formal checks | Property, checker result, assumptions, implementation connection | A proved model is not proof of the application |
 
 ## Report behavior
 
 Lead with the evidence that explains the verdict: a failed or unknown check's
-evidence when present, otherwise the captured application. A requested
+evidence when present, otherwise the captured application. With a change
+scope, that evidence opens beside the [change map](#change-map). A requested
 comparison shows both versions and names any missing capture. A standalone
 preview needs no baseline. Checks and technical details sit one disclosure
 away.
@@ -67,9 +69,14 @@ Keep these dimensions separate:
 
 | Dimension | Values |
 | --- | --- |
-| Execution | Complete, blocked, failed |
+| Execution | Complete, capture failed, unavailable |
 | Difference | Unchanged, changed, unavailable |
-| Named check | Passed, failed, unknown, not configured |
+| Named check | Passed, failed, unknown, not run |
+| Check against base | Regression, when the base passed the same expectation |
+| Run conclusion | Regression, check failed, unavailable, no regression, no regression in the named checks, not checked, preview |
+| Artifact integrity | Hash matched, unavailable |
+| Changed file | Checked, exercised, not observed, outside the captured source |
+| Recipe difference | Added by this change, removed by this change, altered by this change, proposed, test file changed |
 | Interpretation | Expected change, suspected regression, confirmed regression |
 
 - A behavior can change while its checks pass.
@@ -77,6 +84,8 @@ Keep these dimensions separate:
   expectation. If another rule establishes a failure, name the rule and
   disclose any missing baseline.
 - Missing evidence never becomes a pass, and an absent check is not a pass.
+- A check that one side lacks reads "not run" on that side when its capture
+  completed, and "unknown" when the capture did not complete.
 - A source location is a fact about where evidence was read: "thrown at
   App.jsx:10", never "caused by App.jsx:10". Show a line only when the
   evidence places it there, or when a name matches a changed line and is
@@ -84,10 +93,33 @@ Keep these dimensions separate:
 - Counts refer to named checks. Never imply complete coverage of the change or
   readiness to merge.
 
+### Writing
+
+Generated text follows a reduced form of ASD-STE100, the controlled English
+written for aircraft maintenance manuals. Observed copies its rules, not its
+dictionary, which ASD holds the copyright to.
+
+- Each status word has one meaning, defined once in `statusWords` in
+  `src/result-text.ts`. A test over the report, the PR comment, and the agent
+  handoffs rejects synonyms such as "verified", "safe", and "no issues".
+- An instruction has at most 20 words and tells the reader to do one thing. A
+  statement of fact has at most 25 words.
+- Facts and instructions stay in separate sections. The agent handoff lists
+  the facts, then the next steps.
+- A check is named after the behavior it protects, such as "Each Load items
+  click sends one item request". The setup guide asks the agent for names in
+  this form. A journey is named after the user's action, such as "Load items".
+  The PR comment leads with the name of each failed or unknown check, then
+  the count line.
+- No analogies and no "explain like I'm five" version. An analogy adds claims
+  that the evidence does not make: two captured requests are not proof of a
+  double charge. Check names supply the plain words.
+
 ## Change scope
 
-Planned for Phase 3a. Not built. Today a result covers its named checks and
-says nothing about the files a change touched.
+Built as `result.json` data, as text in the report, the job summary, and the
+pull request comment, and as the change map in the viewer. Generated journeys
+are not built. Browser coverage is the only coverage collector.
 
 A saved journey checks the behavior it exercises. It does not check the
 change. Every comparison lists each file that differs between base and
@@ -96,17 +128,74 @@ candidate with one relation:
 | Relation | Meaning | Claim limit |
 | --- | --- | --- |
 | Checked | A named check evaluated evidence that touched the file | Only that check's expectation and scope |
-| Exercised | Execution coverage or another record shows changed lines of the file ran in a journey | The code ran. Nothing says it ran correctly |
-| Not observed | The file changed and no evidence touched it | Nothing is known about this change |
+| Exercised | Execution coverage or another record shows that lines in scope ran in a journey | The code ran. Nothing says it ran correctly |
+| Not observed | No evidence touched the lines in scope | Nothing is known about those lines |
 | Outside the captured source | The file changed outside the project's `source.paths` | Neither snapshot contains it |
+
+The lines in scope depend on the view. In the change map they are the file's
+changed lines. In the [repository map](#repository-map), which has no diff,
+they are all of the file's lines.
 
 Each relation records its basis, such as execution coverage, a stack frame, a
 component source, or a test location. Label a name match as a match. With no
-basis the relation is "not observed", never a guess. Coverage counts changed
-lines that ran and changed lines that did not, so a journey can exercise part
+basis the relation is "not observed", never a guess. Coverage counts the lines
+in scope that ran and the lines that did not, so a journey can exercise part
 of a file. A file that no collector can execute, such as a stylesheet, a type
 declaration, or code for a server runtime without a collector, is "not
 observed" with that reason, and the agent spends no budget on it.
+
+### Change map
+
+The report draws the change scope as a map. The table of changed files stays
+as the map's text version, with the same facts, so the map makes no claim that
+the table lacks.
+
+- A block is a changed file, or a file that imports one or is imported by one.
+  Blocks group by directory. Selecting a directory opens it, and Escape goes
+  back up. A package outside the captured source is one block, outside the
+  directory groups. Journeys and the routes they requested are blocks of
+  their own layer.
+- A changed file's chip is its relation: checked, exercised, not observed, or
+  outside the captured source. Unchanged files give context and have no chip.
+- Each connection comes from evidence records of one type, and each type has
+  one source:
+
+| Connection | Source |
+| --- | --- |
+| Imports | The static import graph of each snapshot |
+| Ran in | Execution coverage, with the count of lines in scope that ran and that did not |
+| Requested | The request ledger: method, route, status, and count on each side |
+| Threw at | An error record and its stack frame |
+| Checked by | A named check and its scope |
+
+- Pointing at a block dims every block without a connection to it. Journeys
+  are a separate layer, and their connections show only on hover or
+  selection.
+- Selecting a block opens a side panel with its changed lines, the journeys
+  that ran them, the checks that covered them, and the artifact paths. A
+  connection's label is its evidence, such as "GET /api/items: 2 requests,
+  base 1".
+- When a comparison has a change scope, the map is the report's main view.
+  The side panel opens on the evidence that explains the verdict: a failed or
+  unknown check's evidence when present, otherwise the captured application.
+  A preview has no change scope and opens on the captured application.
+
+### Repository map
+
+Without a change, the same map covers every file in `source.paths`. Every
+file gets a chip from the latest capture, with the relations above: checked,
+exercised, or not observed. The map shows what Observed
+watches in the project and what it does not. It does not show services, data
+stores, or production traces.
+
+### Agent descriptions
+
+The person's agent can supply a short description of each block and
+connection, in a file of its own for one run. Each description names the
+source files it was written from and follows the writing rules above. The map
+shows descriptions in the inference color, labeled as written by the
+agent. They never set a chip, a count, or a verdict, and the map works without
+them. Observed does not call a model to write them.
 
 ### Generated journeys
 
@@ -147,8 +236,15 @@ the protected one.
 | Expectation altered | By the base's expectation. The candidate's version is shown beside it as proposed, with its own outcome, and sets no verdict |
 | Check removed | By the base's definition, when the evidence it needs was still captured. Otherwise unknown |
 | Check added | On the candidate, labeled "added by this change", with no baseline |
-| Journey steps altered | Every check in that journey is unknown, with both versions of the steps shown |
+| Journey altered | Every check in that journey is unknown, with both versions of each changed field shown. The fields are path, ready, steps, collectors, viewport, browser arguments, allowed origins, and maximum age |
+| Journey removed | Every check in that journey is unknown, because neither capture ran it |
+| No usable `observed.json` on the base | Every check counts as added, and the result gives the reason |
 | Imported test whose file changed | By the candidate's file, labeled as changed by this change. A failure is not called a regression, and a pass carries the label |
+
+Observed parses both files before it compares them, so key order,
+whitespace, `check` versus a one-item `checks`, and a journey field left at
+its default are not differences. A check field written out at its default is
+a difference, judged as an altered check. If Git cannot read the base's file, every check is unknown.
 
 A relaxed expectation cannot turn a fault into a pass. An intended contract
 change fails or stays unknown on the pull request that makes it, and resolves
@@ -160,7 +256,10 @@ policy, not a verdict.
 A run whose checks all pass while files are not observed reads "No regression
 in the named checks", followed by the count of files not observed. It never
 reads as a verified change. When no captured file changed, say so, because
-the checks then describe unchanged behavior.
+the checks then describe unchanged behavior. If files outside the captured
+source changed, or Git could not list them, say only that no captured file
+changed. A change outside the snapshot can still change behavior, and gate 7
+asks the result to claim nothing about the change.
 
 ## What each source establishes
 
@@ -198,10 +297,10 @@ output appears only where a finding has a source location.
 - Every run states what it posted and what it skipped, with the reason. A
   skipped delivery never changes the verdict.
 - The PR line names the head commit and leaves out "automatically fixed"
-  until repair exists. Today it reads "N issues found · N behaviors verified ·
-  N unresolved". The target is "N issues found · N checks passed · N
-  unresolved", counting failed, passed, and unknown named checks, then the
-  change scope, such as "2 of 7 changed files not observed".
+  until repair exists. It reads "N checks passed", then each count of
+  regressed, failed, unknown, and not run checks that is not zero, such as
+  "4 checks passed · 1 failed". The target adds the change scope, such as
+  "2 of 7 changed files not observed".
 - Generated journeys run locally in the first release. A run in CI lists the
   files that are not observed and adds them to the agent prompt.
 - Reuse established permissions for routine work. Ask when intent,
@@ -242,9 +341,10 @@ routing, coverage for server runtimes other than Node and Bun, remote rerun
 actions, and database, job, and trace evidence. Bun coverage depends on
 mapping its offsets to source lines, which is untested.
 
-Also deferred: a new agent runtime, a mandatory daemon, a universal graph, a
-plugin marketplace, generic production observability, automatic merging,
-billing, Kubernetes, and broad framework support.
+Also deferred: a new agent runtime, a mandatory daemon, a graph of services
+and data stores beyond the captured source, a plugin marketplace, generic
+production observability, automatic merging, billing, Kubernetes, and broad
+framework support.
 
 ## Background
 

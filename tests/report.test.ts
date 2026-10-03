@@ -177,7 +177,7 @@ test('retains real supplied results without converting imported PASS text into i
   );
 
   expect(markdown).toContain(
-    'Behavior was not independently verified by Observed.',
+    'Observed did not run these checks. It imported their results.',
   );
 
   expect(markdown).toContain('Base: Unknown: No baseline captured');
@@ -344,7 +344,7 @@ test('missing supplied hashes remain unverified and failed supplied results stay
     '0 imported passed; 1 imported failed; 0 unknown checks.',
   );
 
-  expect(markdown).toContain('computed; no supplied hash to verify');
+  expect(markdown).toContain('computed; no supplied hash to compare');
 
   expect(markdown).not.toContain('matched supplied hash');
 });

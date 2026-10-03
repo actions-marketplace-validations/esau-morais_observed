@@ -1,10 +1,12 @@
 import { Console, Effect, FileSystem } from 'effect';
 import path from 'node:path';
+import { gitChanges } from './capture/changed-files';
 import { captureApplication } from './capture/coordinator';
 import { processOutput } from './capture/process';
 import { json } from './encoding';
 import { exportComparison } from './export';
 import { packaged } from './installation';
+import { readBaseJourneys } from './capture/base-project';
 import { loadProject } from './project';
 
 export const buildViewer = Effect.fnUntraced(function* (
@@ -48,7 +50,12 @@ export const runProject = Effect.fn('runProject')(function* (options: {
   quiet?: boolean;
 }) {
   const fs = yield* FileSystem.FileSystem;
-  const { root, project, recipes } = yield* loadProject(options.projectRoot);
+  const {
+    root,
+    project,
+    journeys: defined,
+    recipes,
+  } = yield* loadProject(options.projectRoot);
   const directory = path.resolve(options.directory);
   yield* fs.makeDirectory(directory, { mode: 0o700 });
   yield* fs.makeDirectory(path.join(directory, 'captures'));
@@ -132,6 +139,28 @@ export const runProject = Effect.fn('runProject')(function* (options: {
     return yield* Effect.die('A project has at least one journey');
   }
 
+  const changes =
+    options.baseRevision === null
+      ? undefined
+      : yield* gitChanges({
+          projectRoot: root,
+          baseRevision: options.baseRevision,
+          candidateRevision: options.candidateRevision,
+          transcript: path.join(directory, 'changes-transcript.jsonl'),
+        });
+  // Both sides ran the candidate's journeys; the base's file judges them.
+  const sources =
+    options.baseRevision === null
+      ? undefined
+      : {
+          base: yield* readBaseJourneys({
+            projectRoot: root,
+            baseRevision: options.baseRevision,
+            transcript: path.join(directory, 'base-project-transcript.jsonl'),
+          }),
+          candidate: defined,
+        };
+
   return yield* Effect.gen(function* () {
     const viewerDirectory = yield* buildViewer(
       options.toolRoot,
@@ -143,6 +172,8 @@ export const runProject = Effect.fn('runProject')(function* (options: {
       journeys: [first, ...rest],
       directory: path.join(directory, 'report'),
       mode: options.baseRevision === null ? 'preview' : 'comparison',
+      ...(changes === undefined ? {} : { changes }),
+      ...(sources === undefined ? {} : { recipes: sources }),
     });
   }).pipe(Effect.scoped);
 });

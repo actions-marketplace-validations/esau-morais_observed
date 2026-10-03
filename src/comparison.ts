@@ -15,6 +15,7 @@ import {
   importedAuthority,
   playwrightPairs,
   unknownPlaywrightChecks,
+  unknownRun,
 } from './checks/playwright';
 import type {
   CheckIdentity,
@@ -31,25 +32,45 @@ import {
 } from './evidence-kinds';
 import { json, sha256 } from './encoding';
 import path from 'node:path';
+import { changeMap } from './change-map';
+import {
+  changeScope,
+  coverageSchemaVersion,
+  parseCoverage,
+  type CoverageRecord,
+  type ScopeJourney,
+} from './change-scope';
 import type {
+  ChangeScope,
   Check,
   CheckVerdict,
   Comparison,
   Conclusion,
+  GitChanges,
   Journey,
   JourneySelection,
   Measure,
+  Proposed,
   Selection,
   Side,
   SideArtifact,
   UnknownCheck,
+  VerdictRecipe,
   Visual,
 } from './comparison-model';
 import {
   conclusionKinds,
   everyCaptureFailed,
+  proposedOf,
   resultSchemaVersion,
+  runVerdicts,
 } from './comparison-model';
+import {
+  recipePlan,
+  sameDefinition,
+  type JourneyJudgement,
+  type RecipePlan,
+} from './recipe-diff';
 import {
   inspectArtifact,
   readVerifiedArtifact,
@@ -200,6 +221,7 @@ export type CheckPair = {
   // Set when a comparable, known pair establishes a regression.
   regression: string | null;
   measure?: Measure;
+  recipe?: VerdictRecipe;
 };
 
 const unknownEvaluation = (detail: string): Evaluation => ({
@@ -354,18 +376,206 @@ function evaluateDefinition<K extends CheckDefinition['kind']>(
   return evaluateCheck(kind, definition, sides);
 }
 
+function proposed({ candidate, measure }: CheckPair): Proposed {
+  return {
+    expectation: candidate.expectation,
+    outcome: candidate.outcome,
+    detail: candidate.detail,
+    ...(measure === undefined ? {} : { measure }),
+  };
+}
+
+function unknownPair(
+  definition: CheckDefinition,
+  detail: string,
+  recipe?: VerdictRecipe,
+): CheckPair {
+  const check = checkResult(
+    definition,
+    expectationFor(definition),
+    unknownEvaluation(detail),
+  );
+
+  return {
+    base: check,
+    candidate: check,
+    regression: null,
+    ...(recipe === undefined ? {} : { recipe }),
+  };
+}
+
+function listed(values: readonly string[]): string {
+  return values.length <= 1
+    ? values.join('')
+    : `${values.slice(0, -1).join(', ')} and ${values.at(-1) ?? ''}`;
+}
+
+// The base's definition of a check judges both captures. A check only the
+// candidate defines has no baseline, and a journey whose fields changed
+// leaves every check unknown, since its captures follow the candidate's
+// journey.
+function executedPairs(
+  sides: Parameters<typeof evaluateCheck>[2],
+  judgement: JourneyJudgement,
+): CheckPair[] {
+  const evaluate = (definition: CheckDefinition) =>
+    evaluateDefinition(definition, sides);
+  const captured = sides.candidate.recipe.checks;
+  const added = (definition: CheckDefinition): CheckPair => ({
+    ...evaluate(definition),
+    base: null,
+    regression: null,
+    recipe: { change: 'added' },
+  });
+
+  if (judgement.kind === 'not-compared') {
+    return captured.map(evaluate);
+  }
+
+  if (judgement.kind === 'added') {
+    return captured.map(added);
+  }
+
+  if (judgement.kind === 'unreadable') {
+    return captured.map((definition) =>
+      unknownPair(
+        definition,
+        `The base revision's observed.json could not be read, so no check can be judged. ${judgement.reason}`,
+      ),
+    );
+  }
+
+  const baseOnly = judgement.base.filter(
+    (definition) => !captured.some((item) => item.id === definition.id),
+  );
+  const [field, ...fields] = judgement.fields;
+
+  if (field !== undefined) {
+    const detail = `This change alters the journey's ${listed([field, ...fields])}, so the captures cannot apply the base's checks.`;
+
+    return [
+      ...captured.map((definition) =>
+        unknownPair(
+          judgement.base.find((item) => item.id === definition.id) ??
+            definition,
+          detail,
+          {
+            change: 'journey-altered',
+            fields: [field, ...fields],
+            proposed: proposed(evaluate(definition)),
+          },
+        ),
+      ),
+      ...baseOnly.map((definition) =>
+        unknownPair(definition, detail, {
+          change: 'journey-altered',
+          fields: [field, ...fields],
+        }),
+      ),
+    ];
+  }
+
+  return [
+    ...captured.map((definition): CheckPair => {
+      const previous = judgement.base.find((item) => item.id === definition.id);
+
+      if (previous === undefined) {
+        return added(definition);
+      }
+
+      return sameDefinition(previous, definition)
+        ? evaluate(definition)
+        : {
+            ...evaluate(previous),
+            recipe: {
+              change: 'altered',
+              proposed: proposed(evaluate(definition)),
+            },
+          };
+    }),
+    ...baseOnly.map((definition): CheckPair => ({
+      ...evaluate(definition),
+      recipe: { change: 'removed' },
+    })),
+  ];
+}
+
+// Imported tests follow the journey's judgement. Their definitions live in
+// the app's test files: a new journey gives them no baseline, and a changed
+// journey or an unread base file leaves them unknown.
+function judgedImports(
+  pairs: readonly CheckPair[],
+  judgement: JourneyJudgement,
+): CheckPair[] {
+  const unknown = (pair: CheckPair, detail: string): CheckPair => {
+    const check: Check = {
+      ...pair.candidate,
+      outcome: 'unknown',
+      actual: null,
+      detail,
+    };
+
+    return {
+      base: pair.base === null ? null : check,
+      candidate: check,
+      regression: null,
+    };
+  };
+
+  switch (judgement.kind) {
+    case 'not-compared':
+      return [...pairs];
+    case 'added':
+      return pairs.map((pair) => ({
+        ...pair,
+        base: null,
+        regression: null,
+        recipe: { change: 'added' },
+      }));
+    case 'unreadable':
+      return pairs.map((pair) =>
+        unknown(
+          pair,
+          `The base revision's observed.json could not be read, so no check can be judged. ${judgement.reason}`,
+        ),
+      );
+    case 'compared': {
+      const [field, ...fields] = judgement.fields;
+
+      return field === undefined
+        ? [...pairs]
+        : pairs.map((pair) => ({
+            ...unknown(
+              pair,
+              `This change alters the journey's ${listed([field, ...fields])}, so the captures cannot apply the base's checks.`,
+            ),
+            recipe: {
+              change: 'journey-altered',
+              fields: [field, ...fields],
+              proposed: proposed(pair),
+            },
+          }));
+    }
+    default:
+      return judgement satisfies never;
+  }
+}
+
 function evaluatePairs(
   base: CompleteSide | null,
   candidate: CompleteSide,
   mode: 'preview' | 'comparison',
   comparable: boolean,
-): CheckPair[] {
-  return [
-    ...candidate.recipe.checks.map((definition) =>
-      evaluateDefinition(definition, { base, candidate, mode, comparable }),
-    ),
-    ...playwrightPairs({ base, candidate, mode, comparable }),
-  ];
+  judgement: JourneyJudgement = { kind: 'not-compared' },
+): { executed: CheckPair[]; imported: CheckPair[] } {
+  const sides = { base, candidate, mode, comparable };
+  const judged: JourneyJudgement =
+    mode === 'preview' ? { kind: 'not-compared' } : judgement;
+
+  return {
+    executed: executedPairs(sides, judged),
+    imported: judgedImports(playwrightPairs(sides), judged),
+  };
 }
 
 function comparableConditions(capture: Capture) {
@@ -805,9 +1015,7 @@ export const inspectSide = Effect.fn('inspectSide')(function* ({
       ) ?? [];
     const evidence = { artifacts, unresolved: [...reasons, ...errors] };
     const checks = unknownChecks(
-      reasons.length === 0
-        ? 'Verified observations unavailable'
-        : reasons.join('; '),
+      reasons.length === 0 ? 'Observations unavailable' : reasons.join('; '),
       recipe,
     );
 
@@ -844,11 +1052,16 @@ export const inspectSide = Effect.fn('inspectSide')(function* ({
         unresolved: errorsListed(views) ? reasons : evidence.unresolved,
       } satisfies Side;
 
+      const { executed, imported } = evaluatePairs(
+        null,
+        side,
+        'preview',
+        false,
+      );
+
       return {
         ...side,
-        checks: evaluatePairs(null, side, 'preview', false).map(
-          (pair) => pair.candidate,
-        ),
+        checks: [...executed, ...imported].map((pair) => pair.candidate),
       } satisfies Side;
     }
 
@@ -1072,10 +1285,11 @@ function verdictsFor(
     }));
   }
 
-  return pairs.map(({ candidate: check, regression, measure }) => {
+  return pairs.map(({ candidate: check, regression, measure, recipe }) => {
     const common = {
       ...identity(check),
       ...(measure === undefined ? {} : { measure }),
+      ...(recipe === undefined ? {} : { recipe }),
     };
 
     if (regression !== null) {
@@ -1154,6 +1368,38 @@ function runConclusionText(
     .join(' ');
 }
 
+const proposedOutcomes = {
+  passed: 'passed',
+  failed: 'failed',
+  unknown: 'is unknown',
+  'not-run': 'did not run',
+} satisfies Record<Proposed['outcome'], string>;
+
+const addedText = 'This change adds the check, so it has no baseline.';
+
+function recipeNote({ recipe, verdict }: CheckVerdict): string {
+  const proposal = proposedOf(recipe);
+
+  switch (recipe?.change) {
+    case undefined:
+    case 'added':
+      return '';
+    case 'altered':
+    case 'journey-altered':
+      return proposal === undefined
+        ? ''
+        : ` The candidate's proposed version ${proposedOutcomes[proposal.outcome]} and sets no verdict.`;
+    case 'removed':
+      return verdict === 'unknown'
+        ? ''
+        : " This change removes the check, so the base's definition judged both captures.";
+    case 'test-file-changed':
+      return verdict === 'passed' ? ' This change alters its test file.' : '';
+    default:
+      return recipe satisfies never;
+  }
+}
+
 function journeyConclusion(
   base: Side,
   candidate: Side,
@@ -1183,7 +1429,7 @@ function journeyConclusion(
     return {
       kind: 'regression',
       text: sentences(
-        regressions.map((item) => item.detail),
+        regressions.map((item) => `${item.detail}${recipeNote(item)}`),
         (count) =>
           `${count} more ${count === 1 ? 'check' : 'checks'} regressed.`,
       ),
@@ -1201,8 +1447,12 @@ function journeyConclusion(
             return `${item.name}: failed.`;
           }
 
+          if (item.recipe?.change === 'added') {
+            return `${item.name} failed. ${addedText} Candidate: ${describeActual(after)}. ${item.expectation}`;
+          }
+
           if (comparison.kind !== 'available') {
-            return `${item.name} failed. The revisions were not compared, so a regression cannot be established. Candidate: ${describeActual(after)}. ${item.expectation}`;
+            return `${item.name} failed. The revisions were not compared, so a regression cannot be established. Candidate: ${describeActual(after)}. ${item.expectation}${recipeNote(item)}`;
           }
 
           const readings = {
@@ -1222,7 +1472,7 @@ function journeyConclusion(
             return `${item.name} failed. ${before === undefined || before.outcome === 'passed' ? '' : `${reading} `}${item.detail}`;
           }
 
-          return `${item.name} failed. ${reading} Base: ${describeActual(before)}; candidate: ${describeActual(after)}. ${item.expectation}`;
+          return `${item.name} failed. ${reading} Base: ${describeActual(before)}; candidate: ${describeActual(after)}. ${item.expectation}${recipeNote(item)}`;
         }),
         (count) => `${count} more ${count === 1 ? 'check' : 'checks'} failed.`,
       ),
@@ -1255,7 +1505,9 @@ function journeyConclusion(
     return {
       kind: 'unavailable',
       text: sentences(
-        unknown.map((item) => `${item.name}: unknown. ${item.detail}`),
+        unknown.map(
+          (item) => `${item.name}: unknown. ${item.detail}${recipeNote(item)}`,
+        ),
         (count) =>
           `${count} more ${count === 1 ? 'check is' : 'checks are'} unknown.`,
       ).concat(notRunText),
@@ -1274,8 +1526,8 @@ function journeyConclusion(
       kind: 'not-checked',
       text:
         notRun.length === 0
-          ? 'Before and after captured. No named check is configured, so no behavior was verified.'
-          : `Before and after captured. No named check ran, so no behavior was verified.${notRunText}`,
+          ? 'Before and after captured. No named check is configured, so no behavior was checked.'
+          : `Before and after captured. No named check ran, so no behavior was checked.${notRunText}`,
     };
   }
 
@@ -1292,11 +1544,15 @@ function journeyConclusion(
   return {
     kind: 'no-regression',
     text: sentences(
-      passed.map((item) =>
-        baseOutcome(item.id) === 'passed'
-          ? `${item.name} passed on base and candidate.`
-          : `${item.name} ${baseOutcome(item.id)} on base and passed on candidate.`,
-      ),
+      passed.map((item) => {
+        if (item.recipe?.change === 'added') {
+          return `${item.name} passed on the candidate. ${addedText}`;
+        }
+
+        return baseOutcome(item.id) === 'passed'
+          ? `${item.name} passed on base and candidate.${recipeNote(item)}`
+          : `${item.name} ${baseOutcome(item.id)} on base and passed on candidate.${recipeNote(item)}`;
+      }),
       (count) =>
         `${count} more ${count === 1 ? 'check' : 'checks'} passed on the candidate.`,
     ).concat(notRunText),
@@ -1310,6 +1566,7 @@ export function compareJourney({
   visual,
   mode = 'comparison',
   sources = { base: null, candidate: null },
+  judgement = { kind: 'not-compared' },
 }: {
   base: Side;
   candidate: Side;
@@ -1317,6 +1574,7 @@ export function compareJourney({
   visual: Visual;
   mode?: 'preview' | 'comparison';
   sources?: { base: SideSource | null; candidate: SideSource | null };
+  judgement?: JourneyJudgement;
 }): Journey {
   const base = sideAt(inspectedBase, evaluatedAt);
   const candidate = sideAt(inspectedCandidate, evaluatedAt);
@@ -1357,27 +1615,55 @@ export function compareJourney({
     };
   }
 
-  const pairs =
+  const evaluated =
     candidate.execution === 'complete'
       ? evaluatePairs(
           mode === 'comparison' && base.execution === 'complete' ? base : null,
           candidate,
           mode,
           comparison.kind === 'available',
+          judgement,
         )
       : null;
+  const pairs =
+    evaluated === null ? null : [...evaluated.executed, ...evaluated.imported];
   const verdicts = verdictsFor(pairs, candidate);
   const withChecks = (side: Side, checks: Check[] | undefined): Side =>
     checks === undefined || side.execution !== 'complete'
       ? side
       : { ...side, checks };
+  const bases = (list: readonly CheckPair[]) =>
+    list.flatMap((pair) => (pair.base === null ? [] : [pair.base]));
 
+  // A complete base has a result for every executed check it defines; an
+  // imported test the base did not report keeps the base's own list.
   const evaluatedBase = withChecks(
     base,
-    pairs?.every((pair) => pair.base !== null) === true
-      ? pairs.flatMap((pair) => (pair.base === null ? [] : [pair.base]))
-      : undefined,
+    evaluated === null
+      ? undefined
+      : [
+          ...bases(evaluated.executed),
+          ...(evaluated.imported.every((pair) => pair.base !== null)
+            ? bases(evaluated.imported)
+            : base.checks.filter(
+                (check) => check.authority === importedAuthority,
+              )),
+        ],
   );
+  const redefined = verdicts.some(
+    (verdict) =>
+      verdict.recipe !== undefined &&
+      verdict.recipe.change !== 'test-file-changed',
+  );
+
+  if (redefined && comparison.kind === 'available') {
+    comparison = {
+      ...comparison,
+      basis:
+        "Complete, intact captures of the candidate's journey, with the same application, producer, Observed version, and recorded conditions. The base's observed.json defines this journey differently.",
+    };
+  }
+
   const evaluatedCandidate = withChecks(
     candidate,
     pairs?.map((pair) => pair.candidate),
@@ -1407,24 +1693,61 @@ export function compareJourney({
   return { ...journey, findings: journeyFindings(journey, sources) };
 }
 
+const notRecorded = {
+  recipe:
+    'observed.json was not read from the base revision, because this comparison was made from capture directories',
+  coverage: {
+    kind: 'unavailable',
+    reason: 'Coverage was not read for this comparison',
+  },
+  changes: {
+    kind: 'unavailable',
+    reason:
+      'Git did not list changed files for this comparison, because it was made from capture directories',
+  },
+} as const;
+
 export function summarizeJourneys({
   journeys,
   evaluatedAt,
   mode,
+  scope = changeScope({
+    mode,
+    journeys: journeys.map((journey) => ({
+      journey,
+      sources: { base: null, candidate: null },
+      coverage: notRecorded.coverage,
+    })),
+    changes: notRecorded.changes,
+    recipe: { kind: 'unavailable', reason: notRecorded.recipe },
+  }),
+  removedJourneys = [],
 }: {
   journeys: readonly [Journey, ...Journey[]];
   evaluatedAt: string;
   mode: 'preview' | 'comparison';
+  scope?: ChangeScope;
+  removedJourneys?: Comparison['removedJourneys'];
 }): Comparison {
   const [first] = journeys;
+  const unjudged = removedJourneys.filter(
+    (journey) => journey.checks.length > 0,
+  );
+  const kinds = [
+    ...journeys.map((journey) => journey.conclusion.kind),
+    ...(unjudged.length > 0 ? (['unavailable'] as const) : []),
+  ];
   const kind =
-    conclusionKinds.find((candidate) =>
-      journeys.some((journey) => journey.conclusion.kind === candidate),
-    ) ?? first.conclusion.kind;
+    conclusionKinds.find((candidate) => kinds.includes(candidate)) ??
+    first.conclusion.kind;
   const deciding = journeys.filter(
     (journey) => journey.conclusion.kind === kind,
   );
-  const verdicts = journeys.flatMap((journey) => journey.checks);
+  const verdicts = runVerdicts({ journeys, removedJourneys });
+  const removedText = unjudged.map(
+    (journey) =>
+      `${journey.journey}: this change removes the journey, so no capture ran its checks. Unknown: ${names(journey.checks)}.`,
+  );
 
   return {
     schemaVersion: resultSchemaVersion,
@@ -1442,8 +1765,19 @@ export function summarizeJourneys({
     },
     conclusion: {
       kind,
-      text: runConclusionText(journeys, deciding, mode),
+      text: [runConclusionText(journeys, deciding, mode), ...removedText]
+        .filter((part) => part !== '')
+        .join(' '),
     },
+    changeScope: scope,
+    removedJourneys,
+    changeMap:
+      scope.kind === 'unavailable'
+        ? scope
+        : {
+            kind: 'unavailable',
+            reason: 'The change map is built only from capture directories.',
+          },
   };
 }
 
@@ -1639,18 +1973,64 @@ const loadSideSource = Effect.fnUntraced(
   Effect.catchTag('EvidenceIoError', () => Effect.succeed(null)),
 );
 
+const unreadCoverage = (reason: string): CoverageRecord => ({
+  kind: 'unavailable',
+  reason,
+});
+
+const loadCoverage = Effect.fnUntraced(
+  function* (directory: string, side: Side) {
+    if (side.execution !== 'complete') {
+      return unreadCoverage('The candidate capture is not complete');
+    }
+
+    const { manifest } = side.capture;
+    const entry = manifest.evidence.find((item) => item.kind === 'coverage');
+
+    if (entry === undefined) {
+      return unreadCoverage('The capture recorded no coverage');
+    }
+
+    if (entry.status === 'unavailable') {
+      return unreadCoverage(entry.reason);
+    }
+
+    if (entry.schemaVersion !== coverageSchemaVersion) {
+      return unreadCoverage(
+        `Coverage schema version ${entry.schemaVersion} is unsupported`,
+      );
+    }
+
+    const artifact = manifest.artifacts.find(
+      (item) => item.path === entry.path && item.sha256 === entry.sha256,
+    );
+    const root = yield* nodeIo(() => realpath(directory));
+    const content =
+      artifact === undefined ? null : yield* readArtifactText(root, artifact);
+
+    return content === null
+      ? unreadCoverage('The coverage file is missing or changed')
+      : parseCoverage(content);
+  },
+  Effect.catchTag('EvidenceIoError', () =>
+    Effect.succeed(unreadCoverage('The coverage file could not be read')),
+  ),
+);
+
 export const inspectJourney = Effect.fn('inspectJourney')(function* ({
   baseDirectory,
   candidateDirectory,
   evaluatedAt,
   mode = 'comparison',
   selection,
+  judge = () => ({ kind: 'not-compared' }),
 }: {
   baseDirectory: string | null;
   candidateDirectory: string;
   evaluatedAt: string;
   mode?: 'preview' | 'comparison';
   selection?: JourneySelection;
+  judge?: (journey: string) => JourneyJudgement;
 }) {
   const prefix = (side: 'base' | 'candidate') =>
     selection === undefined ? side : `${selection.directory}/${side}`;
@@ -1700,29 +2080,85 @@ export const inspectJourney = Effect.fn('inspectJourney')(function* ({
     pixels.visual.kind === 'changed'
       ? { ...pixels.visual, diff: { ...pixels.visual.diff, path: diffPath } }
       : pixels.visual;
+  const sources = {
+    base:
+      mode === 'comparison' ? yield* loadSideSource(baseDirectory, base) : null,
+    candidate: yield* loadSideSource(candidateDirectory, candidate),
+  };
   const journey = compareJourney({
     base,
     candidate,
     evaluatedAt,
     visual,
     mode,
-    sources: {
-      base:
-        mode === 'comparison'
-          ? yield* loadSideSource(baseDirectory, base)
-          : null,
-      candidate: yield* loadSideSource(candidateDirectory, candidate),
-    },
+    sources,
+    judgement:
+      candidate.recipe === null
+        ? { kind: 'not-compared' }
+        : judge(candidate.recipe.name),
   });
+  const scope: ScopeJourney = {
+    journey,
+    sources,
+    coverage:
+      mode === 'comparison'
+        ? yield* loadCoverage(candidateDirectory, candidate)
+        : unreadCoverage('A preview has no change scope'),
+  };
 
   return {
     journey,
+    scope,
+    snapshots:
+      sources.base === null ||
+      sources.candidate === null ||
+      baseDirectory === null
+        ? null
+        : {
+            journey,
+            base: {
+              root: path.join(baseDirectory, 'source'),
+              files: sources.base.files,
+            },
+            candidate: {
+              root: path.join(candidateDirectory, 'source'),
+              files: sources.candidate.files,
+            },
+          },
     visualDiff:
       journey.comparison.kind === 'available' && pixels.diff !== null
         ? { path: diffPath, bytes: pixels.diff.bytes }
         : null,
   };
 });
+
+// Journeys only the base defines were never captured, so each check is
+// unknown.
+export function removedJourneys(
+  removed: RecipePlan['removed'],
+): Comparison['removedJourneys'] {
+  const detail =
+    'This change removes the journey, so no capture ran this check.';
+
+  return removed.map((journey) => ({
+    journey: journey.journey,
+    checks: [
+      ...journey.checks.map((definition) => ({
+        ...definition,
+        expectation: expectationFor(definition),
+      })),
+      ...(journey.imports ? [unknownRun(detail)] : []),
+    ].map(({ id, name, scope, expectation }) => ({
+      id,
+      name,
+      scope,
+      expectation,
+      verdict: 'unknown',
+      detail,
+      recipe: { change: 'removed' },
+    })),
+  }));
+}
 
 // Inspects each selected journey under root/<directory>/{base,candidate}.
 export const inspectComparison = Effect.fn('inspectComparison')(function* ({
@@ -1732,8 +2168,10 @@ export const inspectComparison = Effect.fn('inspectComparison')(function* ({
   root: string;
   selection: Selection;
 }) {
+  const plan = recipePlan(selection.recipes, notRecorded.recipe);
   const inspected = yield* Effect.forEach(selection.journeys, (journey) =>
     inspectJourney({
+      judge: plan.judge,
       baseDirectory:
         selection.mode === 'preview'
           ? null
@@ -1750,12 +2188,32 @@ export const inspectComparison = Effect.fn('inspectComparison')(function* ({
     return yield* Effect.die('A selection has at least one journey');
   }
 
+  const changes: GitChanges = selection.changes ?? notRecorded.changes;
+
+  const scope = changeScope({
+    mode: selection.mode,
+    journeys: inspected.map((item) => item.scope),
+    changes,
+    recipe: plan.scope,
+  });
+
   return {
-    result: summarizeJourneys({
-      journeys: [first, ...rest],
-      evaluatedAt: selection.evaluatedAt,
-      mode: selection.mode,
-    }),
+    result: {
+      ...summarizeJourneys({
+        journeys: [first, ...rest],
+        evaluatedAt: selection.evaluatedAt,
+        mode: selection.mode,
+        scope,
+        removedJourneys:
+          selection.mode === 'preview' ? [] : removedJourneys(plan.removed),
+      }),
+      changeMap: changeMap({
+        scope,
+        journeys: inspected.map((item) => item.scope),
+        snapshots:
+          inspected.find((item) => item.snapshots !== null)?.snapshots ?? null,
+      }),
+    },
     visualDiffs: inspected.flatMap((item) =>
       item.visualDiff === null ? [] : [item.visualDiff],
     ),

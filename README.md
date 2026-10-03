@@ -27,9 +27,6 @@ observed setup
   In a container or another Linux machine without desktop libraries, run
   `observed setup --with-deps`, which also installs packages with `sudo apt`.
 - Bun reports one blocked postinstall, from agent-browser. Leave it blocked.
-- This README describes the current alpha. Install it with
-  `@observed-software/cli@alpha`. A plain install gets 0.1.0, which has no
-  guided setup, no `observed skill`, and fewer checks.
 - To run a pinned version without installing it, start each command with
   `bunx @observed-software/cli@<version>`.
 
@@ -134,6 +131,8 @@ The [project schema](src/project.ts) and
 
 #### The journey
 
+- Name the journey after the person's action, such as "Load items". The
+  report and the pull request comment use this name.
 - The browser opens `capture.path` and runs `capture.ready` without recording
   requests. It records requests during `capture.steps`, the journey under
   test. To record the page load itself, start `steps` with a `navigate` step.
@@ -148,6 +147,8 @@ The [project schema](src/project.ts) and
 - A journey's optional `collectors` list records more evidence after `steps`.
   Checks add the collectors they need. The
   [evidence kinds](src/evidence-kinds/index.ts) list what can be collected.
+  Every journey records which source lines ran, through a second run of the
+  journey; `{ "kind": "coverage", "enabled": false }` turns that off.
 - Sign in with a disposable account from committed seed data. `setup` doesn't
   receive fill variables, so commit the account with its password hash and
   pass the password through a fill variable, such as
@@ -162,6 +163,10 @@ The [project schema](src/project.ts) and
 `capture.checks` is an optional list of named checks. Each has a unique `id`,
 a `name` and a `scope` that says what it covers. `capture.check` still accepts
 a single check. Set one or the other.
+
+Name each check after the behavior it protects, such as "Each Load items click
+sends one item request". The pull request comment leads with the name of each
+failed or unknown check, so the name tells a reviewer what broke.
 
 | Kind | Passes when |
 | --- | --- |
@@ -185,13 +190,14 @@ regression.
   names. Vite 8 keeps them with
   `build: { rolldownOptions: { output: { keepNames: true } } }`, and Vite 7
   with `esbuild: { keepNames: true }`.
-- Observed points errors and React findings at source lines through source
-  maps. Build with `build: { sourcemap: 'hidden' }` in Vite, or your bundler's
-  equivalent. Without a map, Observed matches a name only where the diff
-  defines it, and otherwise records why it has no line.
+- Observed points errors and React findings at source lines, and counts
+  the lines that ran, through source maps. Build with
+  `build: { sourcemap: 'hidden' }` in Vite, or your bundler's equivalent.
+  Without a map, Observed matches a name only where the diff defines it, and
+  otherwise records why it has no line.
 - The conditions that make each check unknown, and the Playwright,
-  performance and API collectors, are described in `docs/CONFIGURATION.md` in
-  the Observed repository.
+  performance, coverage and API collectors, are described in
+  `docs/CONFIGURATION.md` in the Observed repository.
 
 ### Checks and collectors in detail
 
@@ -248,9 +254,13 @@ passes the job, `1` and `2` fail it.
 
 - Keep the `pull_request` trigger. Never use `pull_request_target`, which
   gives pull requests from forks the repository's secrets and a write token.
-- Observed reads `observed.json` from the candidate and uses it for both
-  revisions. A pull request that edits it changes the check for both sides, so
-  review those edits like code.
+- Observed captures both revisions with the candidate's `observed.json`. The
+  base's file judges each check it defines, and a journey whose steps or other
+  fields changed leaves its checks unknown. Relaxing a check in
+  `observed.json` therefore cannot turn a fault into a pass. An imported
+  Playwright test is judged by the candidate's test file, labeled when that
+  file changed. The comment names each added, removed and altered check, with
+  the candidate's version beside it as proposed.
 - The action installs Bun and the browser. When `setup` or `start` needs
   another toolchain, such as Go, Python or Node.js, install it in a step before
   Observed's.
@@ -270,7 +280,7 @@ This is the intended final state. Browser capture, comparison, named checks,
 API operations, the report, GitHub and Slack delivery, and test import exist
 today.
 
-Not built yet: relating checks to the files a change touched, protecting
+Not built yet: coverage of the files a change touched, protecting
 expectations from the change that edits them, generated journeys, repair,
 requested reruns, model routing, and database, job, trace and formal
 adapters.

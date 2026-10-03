@@ -1,9 +1,20 @@
+import {
+  recipeLabels,
+  recipeLine,
+  recipeLines,
+  scopeFileLines,
+  scopeLine,
+} from './change-scope-text';
 import { escapeText, link } from './markdown';
 import {
   checkLabels,
   checkSummary,
   conclusionLabels,
   executionLabels,
+  integrityLabels,
+  runLabel,
+  unobservedAfterPassing,
+  unobservedText,
   verdictLabels,
 } from './result-text';
 import type {
@@ -47,7 +58,7 @@ function renderIdentity(side: Side, label: string, level: number): string {
 
 function renderVerdict(verdict: CheckVerdict): string {
   return [
-    `- **${verdictLabels[verdict.verdict]}**: ${escapeText(verdict.name)}`,
+    `- **${verdictLabels[verdict.verdict]}**: ${escapeText(verdict.name)}${verdict.recipe === undefined ? '' : ` · ${recipeLabels[verdict.recipe.change]}`}`,
     `  - Scope: ${escapeText(verdict.scope)}`,
     `  - ${escapeText(verdict.detail)}`,
   ].join('\n');
@@ -152,7 +163,7 @@ function renderArtifacts(side: Side, label: string, level: number): string {
         ? ''
         : ` ${escapeText(artifact.reason)}`;
 
-    return `- ${reference}: ${escapeText(artifact.description)}\n  - Artifact integrity: ${artifact.integrity}.${reason}`;
+    return `- ${reference}: ${escapeText(artifact.description)}\n  - Artifact integrity: ${integrityLabels[artifact.integrity]}.${reason}`;
   });
 
   const screenshot =
@@ -310,12 +321,26 @@ function renderJourney(
         renderMarkdownSection(section),
       ]),
       heading(level, 'Screenshots and original artifacts'),
-      'Screenshots are collector measurements. Artifact integrity describes availability and hash verification, not application correctness.',
+      'Screenshots are collector measurements. Artifact integrity describes availability and hash matches, not application correctness.',
       ...sides((side, label) => renderArtifacts(side, label, level + 1)),
       heading(level, 'Observed, producer, conditions and recipe'),
       ...sides((side, label) => renderProvenance(side, label, level + 1)),
     ],
   };
+}
+
+function renderChangeScope(result: Comparison): string[] {
+  const files = scopeFileLines(result);
+  const recipe = recipeLine(result.changeScope);
+  const differences = recipeLines(result);
+
+  return [
+    '## Change scope',
+    escapeText(scopeLine(result.changeScope)),
+    ...(files.length === 0 ? [] : [list(files)]),
+    ...(recipe === null ? [] : [escapeText(recipe)]),
+    ...(differences.length === 0 ? [] : [list(differences)]),
+  ];
 }
 
 export function renderComparison(result: Comparison): string {
@@ -326,9 +351,12 @@ export function renderComparison(result: Comparison): string {
     `# ${escapeText(result.title)}`,
     ...(single?.screenshots ?? []),
     '## Conclusion',
-    `**${conclusionLabels[result.conclusion.kind]}**`,
+    unobservedAfterPassing(result) > 0
+      ? `**${runLabel(result)}** · ${unobservedText(unobservedAfterPassing(result))}`
+      : `**${runLabel(result)}**`,
     escapeText(result.conclusion.text),
     `${escapeText(checkSummary(result))}.`,
+    ...(result.mode === 'preview' ? [] : renderChangeScope(result)),
     `Evaluated at: ${escapeText(result.evaluatedAt)}`,
     ...(single?.details ??
       result.journeys.flatMap((journey, index) => {

@@ -10,7 +10,12 @@ import {
 } from './capture/model';
 import { json, sha256 } from './encoding';
 import { inspectComparison } from './comparison';
-import { selectionSchema, type JourneySelection } from './comparison-model';
+import {
+  selectionSchema,
+  type GitChanges,
+  type JourneySelection,
+  type RecipeSources,
+} from './comparison-model';
 import { renderComparison } from './comparison-report';
 import { readVerifiedArtifact } from './evidence';
 import { nodeIo, type EvidenceIoError } from './node-io';
@@ -256,11 +261,15 @@ export const exportComparison = Effect.fn('exportComparison')(function* ({
   directory,
   viewerDirectory,
   mode = 'comparison',
+  changes,
+  recipes,
 }: {
   journeys: readonly [JourneyDirectories, ...JourneyDirectories[]];
   directory: string;
   viewerDirectory: string;
   mode?: 'preview' | 'comparison';
+  changes?: GitChanges;
+  recipes?: RecipeSources;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const sides = yield* Effect.forEach(journeys, (journey) =>
@@ -383,6 +392,8 @@ export const exportComparison = Effect.fn('exportComparison')(function* ({
     mode,
     evaluatedAt,
     journeys: selected,
+    ...(changes === undefined ? {} : { changes }),
+    ...(recipes === undefined ? {} : { recipes }),
   });
 
   yield* fs.writeFileString(

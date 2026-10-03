@@ -48,9 +48,11 @@ Read `observed.json` from the base revision as well as the candidate. Capture
 both sides with the candidate's journeys so the captures stay comparable, and
 record every difference between the two files in the result. Judge a check
 that exists on the base by the base's definition. The rules are in
-[PRODUCT.md](PRODUCT.md#change-scope). Today one `observed.json`, read from
-the candidate checkout, drives both sides, so an expectation altered by the
-change applies to the base without a trace.
+[PRODUCT.md](PRODUCT.md#altered-checks). `observe` reads the base's file
+through Git and records the journeys of both files in `selection.json`,
+because the comparator reads only capture directories. `compare` has no
+repository, so its recipe differences read as unavailable, and the captured
+definitions judge the checks.
 
 ## Evidence contract
 
@@ -71,15 +73,17 @@ Hashes detect changed artifacts; they do not establish collector honesty. A stac
 
 ### Change scope
 
-Planned for Phase 3a. Not built.
+Built for result schema version 8, without coverage collectors.
 
 The comparator writes the change scope to `result.json` with the result.
 Delivery adapters and the viewer render it and never compute or adjust it.
 
 1. Changed files come from the two source snapshots, which already hash every
    captured file. Files that Git reports as changed outside `source.paths` are
-   listed as outside the captured source. Without a base snapshot the scope is
-   unavailable, with the reason.
+   listed as outside the captured source. `observe` records those names in
+   `selection.json`, because the comparator reads only capture directories.
+   `compare` has no repository, so it reports them as unavailable. Without a
+   base snapshot the scope is unavailable, with the reason.
 2. A file's relation comes only from recorded evidence. No record means "not
    observed". A file that no collector can execute, such as a stylesheet or a
    type declaration, is "not observed" with that reason.
@@ -88,10 +92,10 @@ Delivery adapters and the viewer render it and never compute or adjust it.
 
 Relations, strongest first:
 
-| Evidence on a changed file | Relation |
+| Evidence on a file | Relation |
 | --- | --- |
 | An anchor from a stack frame, component source, or test location, on a finding that lists a check | Checked |
-| Coverage shows a changed line ran | Exercised |
+| Coverage shows a line in scope ran | Exercised |
 | An anchor on a finding that lists no check | Exercised |
 | A name match against the diff | Exercised at most, labeled as a match |
 | None | Not observed |
@@ -99,12 +103,13 @@ Relations, strongest first:
 The wording and the rules for altered checks are in
 [PRODUCT.md](PRODUCT.md#change-scope).
 
-Coverage collectors supply the "exercised" relation. None is built. Probes on
-2026-09-29 showed that each source below returns execution counts.
+Coverage collectors supply the "exercised" relation. The browser collector is
+built, as [CONFIGURATION.md](CONFIGURATION.md#browser-coverage) describes.
+Probes on 2026-09-29 showed that each source below returns execution counts.
 
 | Runtime | How | Known limit |
 | --- | --- | --- |
-| Browser | agent-browser 0.38.1 has no coverage command. It prints the browser's DevTools address (`get cdp-url`), and a second DevTools client takes [precise coverage](https://chromedevtools.github.io/devtools-protocol/tot/Profiler/#method-startPreciseCoverage) on the page | On the bundled React example, ranges resolved through the source map to the original files. One run with the second client and one without recorded the same 7 HAR entries and 2 React renders |
+| Browser | agent-browser 0.38.1 and 0.38.2 have no coverage command (their help and release notes, checked 2026-10-03). agent-browser prints the browser's DevTools address (`get cdp-url`), and a second DevTools client takes [precise coverage](https://chromedevtools.github.io/devtools-protocol/tot/Profiler/#method-startPreciseCoverage) on the page | On the bundled React example, ranges resolved through the source map to the original files. StyleX's build step drops its map, which shifts the `App.tsx` lines; the collector leaves such a file out. One run with the second client and one without recorded the same 7 HAR entries and 2 React renders |
 | Node server | The same protocol through `--inspect` | Probed on a small JavaScript server. TypeScript and source maps are untested. `NODE_V8_COVERAGE` wrote nothing when the process was stopped with SIGTERM |
 | Bun server | Bun's inspector has no `Profiler` domain. `Runtime.enableControlFlowProfiler` and `Runtime.getBasicBlocks` report executed blocks when the server starts with `--inspect-wait` | Offsets are in Bun's transpiled output. Mapping them to source lines is untested, and Bun stays in scope only if it works |
 | Other runtimes | A collector per runtime | Not probed. Their files stay "not observed", with that reason |
@@ -114,12 +119,72 @@ Coverage collectors supply the "exercised" relation. None is built. Probes on
 - Attach to the page target by its address. The first page target can be the
   browser's own new-tab page.
 - Map ranges to source lines through source maps, then intersect them with the
-  changed lines. Today the capture fetches maps only for scripts that an error
-  frame or a React component names.
+  changed lines. A map that embeds a copy of a file different from the
+  snapshot gives no lines for that file, because its line numbers count the
+  lines of another text.
 - Run coverage in the separate browser session, never in the one that takes
   timing samples, because instrumentation changes timing.
 - Server coverage changes how the app starts. It applies only when the
   project's `start` runs Node or Bun, and the run records that it did.
+
+### Change map data
+
+Built for result schema version 8 as `changeMap`, next to `changeScope`.
+The repository map is not built.
+
+The comparator writes the map's blocks and connections to `result.json` with
+the change scope. Every connection lists the evidence it came from: the
+report path of a verified artifact, or a journey's finding by its ID. A
+snapshot file that fails its integrity check gives no import connection. The
+viewer lays out and draws the map and never adds a block or a connection.
+
+- Imports come from `Bun.Transpiler.scan` on each JavaScript or TypeScript
+  file in a snapshot, resolved with `Bun.resolveSync` against that snapshot.
+  A probe on 2026-10-03 with Bun 1.4.2 returned the four imports of the
+  Request lab's `App.tsx` and resolved all four. The map draws the
+  candidate's imports and marks the imports the change removed. Files in
+  other languages have no import connections, and the map says so. The scan
+  drops type-only imports and keeps dynamic `import()` calls with a literal
+  path.
+- `Bun.resolveSync` installs a package it cannot find: on 2026-10-03 with
+  Bun 1.4.2, resolving `left-pad` from a directory without it downloaded the
+  package into Bun's cache. The comparator therefore resolves only relative
+  specifiers and those matching a `paths` alias in a `tsconfig.json` or
+  `jsconfig.json` of the snapshot, taken from the config nearest the
+  importing file as Bun does. A wildcard alias counts only when `*` follows a
+  slash, as in `@/*`, so a key such as `@*` cannot pass scoped package names
+  to the resolver. It does not follow `extends`. Any other
+  specifier is a package block named after the package.
+- Layout is presentation, not evidence. The viewer uses
+  [elkjs](https://github.com/kieler/elkjs) for layered layout with nested
+  directories. It is bundled into the built viewer, not installed as a
+  package runtime dependency. Observed uses its EPL-2.0 license option, and
+  its notice goes into the third-party notices.
+- A repository map is a single capture's scope over every file in
+  `source.paths`.
+
+Agent descriptions are explanation records from the
+[evidence contract](#evidence-contract). Observed validates the file with a
+schema, rejects a description that names a file outside the snapshot, redacts
+it like any artifact, and renders it as text.
+
+### Replay
+
+Planned for Phase 3a. Not built.
+
+The capture records each side with `agent-browser record start`. The help
+text of `agent-browser record` in 0.38.1, read on 2026-10-03, says it
+"Requires ffmpeg on PATH with the libvpx and libx264 encoders". A probe that
+day found that the PATH that counts is the one the session's daemon started
+with. With ffmpeg missing from it, `record start` exited 1 with "ffmpeg not
+found or failed to execute". Then the replay is unavailable, with that reason,
+and nothing else changes. Captions come from the action timeline's steps and
+their times.
+
+Record the session that produced the checked evidence, so the replay shows the
+run that the verdict describes. Recording can change timing, so a journey with
+a timing check records its separate coverage session instead, and the replay
+is labeled as a separate run.
 
 ### Generated journeys
 

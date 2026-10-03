@@ -7,19 +7,20 @@ import type {
   Measure,
   Side,
 } from './comparison-model';
-import { everyCaptureFailed } from './comparison-model';
+import { everyCaptureFailed, runVerdicts } from './comparison-model';
+import { statusWords } from './status-words';
 
 type Kind = Comparison['conclusion']['kind'];
 
 export type Tone = 'regression' | 'unknown' | 'checked' | 'neutral';
 
 export const conclusionLabels = {
-  regression: 'Regression',
-  'check-failed': 'Check failed',
-  unavailable: 'Unavailable',
-  'no-regression': 'No regression',
-  'not-checked': 'Not checked',
-  preview: 'Preview',
+  regression: statusWords.regression.word,
+  'check-failed': statusWords.checkFailed.word,
+  unavailable: statusWords.unavailable.word,
+  'no-regression': statusWords.noRegression.word,
+  'not-checked': statusWords.notChecked.word,
+  preview: statusWords.preview.word,
 } satisfies Record<Kind, string>;
 
 export const conclusionTones = {
@@ -46,25 +47,44 @@ export const checkTones = {
 } satisfies Record<Check['outcome'], Tone>;
 
 export const executionLabels = {
-  complete: 'Complete',
-  'capture-failed': 'Capture failed',
-  unavailable: 'Unavailable',
+  complete: statusWords.complete.word,
+  'capture-failed': statusWords.captureFailed.word,
+  unavailable: statusWords.unavailable.word,
 } satisfies Record<Side['execution'], string>;
 
 export const checkLabels = {
-  passed: 'Passed',
-  failed: 'Failed',
-  'not-run': 'Not run',
-  unknown: 'Unknown',
+  passed: statusWords.passed.word,
+  failed: statusWords.failed.word,
+  'not-run': statusWords.notRun.word,
+  unknown: statusWords.unknown.word,
 } satisfies Record<Check['outcome'], string>;
 
 export const verdictLabels = {
-  regression: 'Regression',
-  failed: 'Failed',
-  unknown: 'Unknown',
-  passed: 'Passed',
-  'not-run': 'Not run',
+  regression: statusWords.regression.word,
+  failed: statusWords.failed.word,
+  unknown: statusWords.unknown.word,
+  passed: statusWords.passed.word,
+  'not-run': statusWords.notRun.word,
 } satisfies Record<CheckVerdict['verdict'], string>;
+
+export const integrityLabels = {
+  verified: statusWords.hashMatched.word,
+  unavailable: statusWords.unavailable.word,
+} satisfies Record<Side['artifacts'][number]['integrity'], string>;
+
+export function sideOutcome(side: Side, id: string): string {
+  const check = side.checks.find((item) => item.id === id);
+
+  // A capture that did not complete is missing the evidence. A complete
+  // capture whose journey lacks the check never ran it.
+  if (check === undefined) {
+    return checkLabels[side.execution === 'complete' ? 'not-run' : 'unknown'];
+  }
+
+  return check.actual === null
+    ? checkLabels[check.outcome]
+    : `${checkLabels[check.outcome]}, actual ${check.actual}`;
+}
 
 export const verdictTones = {
   regression: 'regression',
@@ -87,16 +107,31 @@ function plural(count: number, one: string, many: string): string {
 }
 
 export function resultCounts(result: Comparison): string {
-  const verdicts = result.journeys.flatMap((journey) =>
-    journey.checks.map((check) => check.verdict),
-  );
+  const verdicts = runVerdicts(result).map((check) => check.verdict);
   const count = (...kinds: CheckVerdict['verdict'][]) =>
     verdicts.filter((verdict) => kinds.includes(verdict)).length;
 
+  const word = (status: keyof typeof statusWords) =>
+    statusWords[status].word.toLowerCase();
+  const others = [
+    {
+      count: count('regression'),
+      text: (n: number) =>
+        plural(n, word('regression'), `${word('regression')}s`),
+    },
+    { count: count('failed'), text: (n: number) => `${n} ${word('failed')}` },
+    {
+      count: count('unknown'),
+      text: (n: number) => `${n} ${word('unknown')}`,
+    },
+    { count: count('not-run'), text: (n: number) => `${n} ${word('notRun')}` },
+  ];
+
   return [
-    `${plural(count('regression', 'failed'), 'issue', 'issues')} found`,
-    `${plural(count('passed'), 'behavior', 'behaviors')} verified`,
-    `${count('unknown', 'not-run')} unresolved`,
+    `${plural(count('passed'), 'check', 'checks')} passed`,
+    ...others.flatMap((item) =>
+      item.count === 0 ? [] : [item.text(item.count)],
+    ),
   ].join(' · ');
 }
 
@@ -165,6 +200,34 @@ export function anchorLocation(
   return null;
 }
 
+// Changed files that no evidence touched in a run whose checks all passed,
+// or 0. Passing checks say nothing about those files, so the run's word names
+// the checks instead, and its tone is not the passing one.
+export function unobservedAfterPassing(result: Comparison): number {
+  return result.conclusion.kind === 'no-regression' &&
+    result.changeScope.kind === 'recorded'
+    ? result.changeScope.files.filter(
+        (file) => file.relation === 'not-observed',
+      ).length
+    : 0;
+}
+
+export function runLabel(result: Comparison): string {
+  return unobservedAfterPassing(result) > 0
+    ? statusWords.noRegressionInNamedChecks.word
+    : conclusionLabels[result.conclusion.kind];
+}
+
+export function runTone(result: Comparison): Tone {
+  return unobservedAfterPassing(result) > 0
+    ? 'neutral'
+    : conclusionTones[result.conclusion.kind];
+}
+
+export function unobservedText(count: number): string {
+  return `${plural(count, 'changed file', 'changed files')} not observed`;
+}
+
 export function headlineParts(result: Comparison): {
   label: string;
   subject: string;
@@ -179,13 +242,15 @@ export function headlineParts(result: Comparison): {
 
   if (captureFailed) {
     subject = captureFailure(result);
+  } else if (unobservedAfterPassing(result) > 0) {
+    subject = unobservedText(unobservedAfterPassing(result));
   } else if (first !== undefined) {
     const measure = shownMeasure(first.check);
 
     subject = `${measure === null ? first.check.name : describeMeasure(measure, result.mode)}${rest.length === 0 ? '' : `, plus ${plural(rest.length, 'more check', 'more checks')}`}`;
   }
 
-  return { label: conclusionLabels[kind], subject, restated: captureFailed };
+  return { label: runLabel(result), subject, restated: captureFailed };
 }
 
 function captureFailure(result: Comparison): string {

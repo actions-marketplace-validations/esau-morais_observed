@@ -112,6 +112,28 @@ The light theme is the website default. Offer light, dark, and system preference
 
 Pair color with a label and a distinct symbol: check, delta, warning, question mark, or annotation. Decorative square pixels may accompany them but cannot carry meaning alone. Keep before and after labels explicit; their neutral lane colors must not imply good and bad.
 
+### Change map colors
+
+Relation chips use the evidence colors. Only "Checked" uses the checked color, because a chip describes a relation, not a check outcome.
+
+| Relation | Role | Symbol |
+| --- | --- | --- |
+| Checked | checked | ✓ |
+| Exercised | neutral surface | ▸ |
+| Not observed | unknown | ? |
+| Outside the captured source | unknown | ∅ |
+
+Each connection type has its own color and line pattern, so the type survives without color. The legend shows both. Every color has at least 5.3:1 against canvas, surface, and muted surface in its theme.
+
+| Connection | Light | Dark | Pattern |
+| --- | --- | --- | --- |
+| Imports | #45595E | #C0CDCC | Solid |
+| Ran in | #276A6A | #86C9C0 | Dash 7 4 |
+| Requested | #80570F | #E1C17A | Dot 2 4 |
+| Threw at | #8E3B63 | #EBA3C4 | Dash-dot 9 3 2 3 |
+| Checked by | #3D4F99 | #AFC0F5 | Long dash 14 4 |
+| Import the change removed | Imports color | Imports color | Round dots 1 5 |
+
 ### Contrast baseline
 
 These ratios were calculated from the solid sRGB token values, not sampled from generated images. They verify these pairs only, not an entire interface.
@@ -226,6 +248,7 @@ Keep report panels and status chips flat. Menus and dialogs may use a modest sha
 | Toast | Brief confirmation with an optional undo; critical failures remain visible in the report |
 | Empty state | Explain what is missing and the next useful action; no invented zero-success state |
 | Agent suggestion | Separate annotation with evidence links and a clear proposed action |
+| Change map | Blocks for files, typed connections with counts, a legend of connection types, hover dimming, nested directories, and a side panel for the selection. The file table is one control away |
 
 ### Evidence semantics
 
@@ -234,8 +257,8 @@ Execution, comparison, check result, and interpretation are separate dimensions.
 | Dimension | Examples | Display rule |
 | --- | --- | --- |
 | Execution | Queued, Running, Complete, Capture failed | Operational state; complete does not mean correct |
-| Difference | Unchanged, Changed, Unknown | Only compare compatible captures |
-| Check result | Passed, Failed, Not run | Name the check and its scope |
+| Difference | Unchanged, Changed, Unavailable | Only compare compatible captures |
+| Check result | Passed, Failed, Unknown, Not run | Name the check and its scope |
 | Interpretation | Expected change, Regression, Suggested cause | Link the basis; label inference explicitly |
 
 "Checked" is shorthand for a named passing check. "Regression" requires a violated expectation. Missing baselines, blocked captures, unobserved behavior, and skipped checks never become a green success state. Keep those rules consistent in the website, product, GitHub summaries, Slack cards, and mobile reports.
@@ -255,13 +278,18 @@ Use the Pixel focus composition as the default: centered headline, one pixel wor
 
 ### Evidence viewer
 
-Start with the captured application. Show both versions when a comparison was
+A comparison with a change scope opens on the
+[change map](docs/PRODUCT.md#change-map), with a side panel on the evidence
+that explains the verdict. A preview, or a comparison without a change scope,
+starts with the captured application. Show both versions when a comparison was
 requested; otherwise show the standalone capture. Keep the page name, selected
 revisions, and unavailable captures visible. Keep checks, requests, and source
 details easy to reach without crowding the main view. A capture with no configured
 check must not imply a pass.
 
-A code diff, screenshot, request list, timing comparison, or state transition can each be the primary view. Pick the view that explains this change; do not force every case into a component tree or network graph.
+Inside the side panel, a code diff, screenshot, replay, request list, timing comparison, or state transition can each be the primary view. Pick the view that explains this change; do not force every case into a component tree or network graph.
+
+On the map, use the evidence colors for relation chips and one color per connection type, each with a distinct line pattern so the type survives without color. Dim unrelated blocks on hover rather than hiding them. Every block and connection is reachable by keyboard in reading order, Enter opens a directory, and Escape goes up. Agent descriptions use the inference color and an "Agent description" label.
 
 ### Mobile and shared reports
 
