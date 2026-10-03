@@ -88,10 +88,10 @@ Delivery adapters and the viewer render it and never compute or adjust it.
 
 Relations, strongest first:
 
-| Evidence on a changed file | Relation |
+| Evidence on a file | Relation |
 | --- | --- |
 | An anchor from a stack frame, component source, or test location, on a finding that lists a check | Checked |
-| Coverage shows a changed line ran | Exercised |
+| Coverage shows a line in scope ran | Exercised |
 | An anchor on a finding that lists no check | Exercised |
 | A name match against the diff | Exercised at most, labeled as a match |
 | None | Not observed |
@@ -152,8 +152,12 @@ it like any artifact, and renders it as text.
 
 Planned for Phase 3a. Not built.
 
-The capture records each side with `agent-browser record start`, which needs
-ffmpeg on `PATH`. Without ffmpeg the replay is unavailable, with that reason,
+The capture records each side with `agent-browser record start`. The help
+text of `agent-browser record` in 0.38.1, read on 2026-10-03, says it
+"Requires ffmpeg on PATH with the libvpx and libx264 encoders". A probe that
+day found that the PATH that counts is the one the session's daemon started
+with. With ffmpeg missing from it, `record start` exited 1 with "ffmpeg not
+found or failed to execute". Then the replay is unavailable, with that reason,
 and nothing else changes. Captions come from the action timeline's steps and
 their times.
 
