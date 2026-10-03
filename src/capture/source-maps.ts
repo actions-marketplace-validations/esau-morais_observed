@@ -11,7 +11,10 @@ import {
   type SourceMapIndex,
 } from '../source-map';
 
-const maxScripts = 20;
+// The coverage collector maps as many. Scripts that error frames and React
+// sources name come first, so a map behind coverage lines can still be left
+// out.
+export const maxMappedScripts = 100;
 const maxBytes = 32 * 1024 * 1024;
 const timeoutMs = 5_000;
 // Map fetching runs inside the capture's own timeout, so it stops starting
@@ -127,7 +130,11 @@ const mapIn = (
 
 // A hidden map sits next to its script without a sourceMappingURL comment,
 // so the adjacent `.map` is tried first.
-const findMap = Effect.fnUntraced(function* (script: URL, origin: string) {
+export const findSourceMap = Effect.fnUntraced(function* (
+  script: URL,
+  origin: string,
+  text?: string,
+) {
   const adjacent = yield* download(
     new URL(`${script.pathname}.map`, script),
     origin,
@@ -141,7 +148,10 @@ const findMap = Effect.fnUntraced(function* (script: URL, origin: string) {
     adjacent.kind === 'failed'
       ? `${script.pathname}.map: ${adjacent.reason}`
       : `${script.pathname}.map is not a version 3 source map`;
-  const body = yield* download(script, origin);
+  const body: Fetched =
+    text === undefined
+      ? yield* download(script, origin)
+      : { kind: 'body', text };
 
   if (body.kind === 'failed') {
     return missing(`${adjacentReason}; the script itself: ${body.reason}`);
@@ -209,6 +219,11 @@ const scriptsToMap = Effect.fnUntraced(function* (
     'react',
     evidenceKinds.react.file,
   );
+  const coverage = yield* readEvidence(
+    directory,
+    'coverage',
+    evidenceKinds.coverage.file,
+  );
   const scripts = [
     ...(errors?.value.entries ?? []).flatMap((entry) =>
       stackFrames(entry.text).map((frame) =>
@@ -218,14 +233,17 @@ const scriptsToMap = Effect.fnUntraced(function* (
     ...(react?.value.sources ?? []).map((source) =>
       source.script.startsWith('/') ? source.script : null,
     ),
+    ...(coverage?.value.scripts ?? []).map((script) =>
+      script.kind === 'mapped' ? script.script : null,
+    ),
   ].filter((script): script is string => script !== null);
 
   return [...new Set(scripts)];
 });
 
 function skipReason(index: number, elapsedMs: number): string | null {
-  if (index >= maxScripts) {
-    return `Only the first ${maxScripts} scripts are mapped`;
+  if (index >= maxMappedScripts) {
+    return `Only the first ${maxMappedScripts} scripts are mapped`;
   }
 
   return elapsedMs > deadlineMs
@@ -234,8 +252,8 @@ function skipReason(index: number, elapsedMs: number): string | null {
 }
 
 // Fetches the source map of every application script that evidence points
-// into, while the application still runs. Anchors are resolved later, when
-// the captures are compared.
+// into or that coverage mapped, while the application still runs. Anchors
+// are resolved later, when the captures are compared.
 export const recordSourceMaps = Effect.fn('recordSourceMaps')(
   function* (options: {
     directory: string;
@@ -261,7 +279,7 @@ export const recordSourceMaps = Effect.fn('recordSourceMaps')(
         continue;
       }
 
-      const found = yield* findMap(new URL(script, origin), origin);
+      const found = yield* findSourceMap(new URL(script, origin), origin);
 
       if (found.kind === 'missing') {
         entries.push({
@@ -310,7 +328,7 @@ export const recordSourceMaps = Effect.fn('recordSourceMaps')(
     options.addArtifact(
       'source-maps',
       sourceMapIndexPath,
-      'Source maps fetched for scripts named by error frames and React sources',
+      'Source maps fetched for scripts named by error frames, React sources and coverage',
     );
   },
 );
