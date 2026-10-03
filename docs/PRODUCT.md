@@ -117,10 +117,9 @@ dictionary, which ASD holds the copyright to.
 
 ## Change scope
 
-Built as `result.json` data and as text in the report, the job summary, and
-the pull request comment. The change map, coverage, and generated journeys
-are not built. Until a coverage collector exists, no file
-is "exercised" through coverage.
+Built as `result.json` data, as text in the report, the job summary, and the
+pull request comment, and as the change map in the viewer. Generated journeys
+are not built. Browser coverage is the only coverage collector.
 
 A saved journey checks the behavior it exercises. It does not check the
 change. Every comparison lists each file that differs between base and
@@ -154,7 +153,8 @@ the table lacks.
 - A block is a changed file, or a file that imports one or is imported by one.
   Blocks group by directory. Selecting a directory opens it, and Escape goes
   back up. A package outside the captured source is one block, outside the
-  directory groups.
+  directory groups. Journeys and the routes they requested are blocks of
+  their own layer.
 - A changed file's chip is its relation: checked, exercised, not observed, or
   outside the captured source. Unchanged files give context and have no chip.
 - Each connection comes from evidence records of one type, and each type has
