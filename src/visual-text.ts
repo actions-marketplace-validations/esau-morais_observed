@@ -48,5 +48,25 @@ export function describeVisual(visual: Visual): string {
   }
 }
 
+// The difference in one short sentence, for summaries that link the images.
+export function changedShare(
+  visual: Extract<Visual, { kind: 'changed' }>,
+): string {
+  return `${share(visual.changedPixels, visual.width * visual.height)} of pixels changed, in ${units(visual.regionCount, region)}.`;
+}
+
+export function visualChange(visual: Visual): string | null {
+  switch (visual.kind) {
+    case 'changed':
+      return changedShare(visual);
+    case 'size-differs':
+      return describeVisual(visual);
+    case 'identical':
+    case 'below-threshold':
+    case 'unavailable':
+      return null;
+  }
+}
+
 export const diffLegend =
   'In the difference image, blue pixels are darker after the change and orange pixels are lighter. Other pixels are faded.';
