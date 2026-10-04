@@ -22,6 +22,10 @@ import { renderReportPage } from '../src/report-page';
 import {
   checkName,
   commentMarker,
+  commitImage,
+  imageRefPrefix,
+  pruneImages,
+  type Target,
   defaultArtifact,
   DeliveryError,
   findComment,
@@ -351,7 +355,6 @@ export function checkRows(
   ];
 }
 
-// Collapsed, so a passing check still states what it covered.
 function passedChecks(result: Comparison): string | null {
   const passed = result.journeys.flatMap((journey) =>
     journey.checks
@@ -363,24 +366,21 @@ function passedChecks(result: Comparison): string | null {
     return null;
   }
 
-  return collapsed(
-    `${toneSymbols.checked} What the passing checks covered`,
-    [
-      ...passed.slice(0, listedChecks).map(({ journey, check }) => {
-        const where =
-          result.journeys.length === 1 ? '' : `${inlineText(journey.title)}: `;
-        const measured =
-          check.measure === undefined
-            ? ''
-            : ` · ${inlineText(describeMeasure(check.measure, result.mode))}`;
+  return [
+    ...passed.slice(0, listedChecks).map(({ journey, check }) => {
+      const where =
+        result.journeys.length === 1 ? '' : `${inlineText(journey.title)}: `;
+      const measured =
+        check.measure === undefined
+          ? ''
+          : ` · ${inlineText(describeMeasure(check.measure, result.mode))}`;
 
-        return `- ${where}${inlineText(check.name)}${measured} · scope: ${inlineText(check.scope)}${label(check)}`;
-      }),
-      ...(passed.length > listedChecks
-        ? [`- ${passed.length - listedChecks} more in the report.`]
-        : []),
-    ].join('\n'),
-  );
+      return `- ${where}${inlineText(check.name)}${measured} · scope: ${inlineText(check.scope)}${label(check)}`;
+    }),
+    ...(passed.length > listedChecks
+      ? [`- ${passed.length - listedChecks} more in the report.`]
+      : []),
+  ].join('\n');
 }
 
 const listedFiles = 6;
@@ -504,6 +504,30 @@ function shownFile(
   return `${fileText(repositoryPath(scope, file), fileHref(result, links, file.path, null))}${file.change === 'modified' ? '' : ` (${file.change})`}`;
 }
 
+// Files that share a reason, such as a script with no source map, are listed
+// together so the reason reads once.
+function fileReasons(
+  result: Comparison,
+  scope: Extract<ChangeScope, { kind: 'recorded' }>,
+  files: readonly ScopeFile[],
+  links: FileLinks | null,
+): string {
+  const groups = new Map<string, string[]>();
+
+  for (const file of files) {
+    const detail = inlineText(fileDetail(result, file));
+
+    groups.set(detail, [
+      ...(groups.get(detail) ?? []),
+      shownFile(result, scope, file, links),
+    ]);
+  }
+
+  return [...groups]
+    .map(([detail, shown]) => `- ${shown.join(', ')} · ${detail}`)
+    .join('\n');
+}
+
 type ScopeView = { table: string; details: string } | null;
 
 // Changed files grouped by the evidence that touched them. Files outside the
@@ -569,21 +593,16 @@ function scopeView(result: Comparison, links: FileLinks | null): ScopeView {
       ...(notes.length === 0
         ? []
         : [notes.map((note) => `- ${inlineText(note)}`).join('\n')]),
-      readFirst(result, scope.files, anchored),
     ].join('\n\n'),
-    details: collapsed(
-      'What touched each file',
-      detailed
-        .map(
-          (file) =>
-            `- ${shownFile(result, scope, file, links)} · ${inlineText(fileDetail(result, file))}`,
-        )
-        .join('\n'),
-    ),
+    details: [
+      readFirst(result, scope.files, anchored),
+      fileReasons(result, scope, detailed, links),
+    ].join('\n\n'),
   };
 }
 
-// Each journey's capture browser and viewport, base included when it differs.
+// Each journey's capture browser and viewport, base included when it
+// differs. Conditions every journey shares are said once.
 function conditionsLines(result: Comparison): string[] {
   const described = (side: Side) => {
     const conditions = side.capture?.manifest.conditions;
@@ -593,19 +612,37 @@ function conditionsLines(result: Comparison): string[] {
       : null;
   };
 
-  return result.journeys.flatMap((journey) => {
-    const where = result.journeys.length === 1 ? '' : `${journey.title}: `;
+  const sentences = result.journeys.map((journey) => {
     const candidate = described(journey.candidate);
     const base = result.mode === 'preview' ? null : described(journey.base);
 
     return [
       ...(candidate === null
         ? []
-        : [`${where}The candidate was captured in ${candidate}.`]),
+        : [`The candidate was captured in ${candidate}.`]),
       ...(base === null || base === candidate
         ? []
-        : [`${where}The base was captured in ${base}.`]),
-    ];
+        : [`The base was captured in ${base}.`]),
+    ].join(' ');
+  });
+
+  if (
+    result.journeys.length > 1 &&
+    sentences.every((sentence) => sentence === sentences[0])
+  ) {
+    return sentences[0] === '' || sentences[0] === undefined
+      ? []
+      : [sentences[0]];
+  }
+
+  return result.journeys.flatMap((journey, index) => {
+    const sentence = sentences[index] ?? '';
+
+    return sentence === ''
+      ? []
+      : [
+          `${result.journeys.length === 1 ? '' : `${journey.title}: `}${sentence}`,
+        ];
   });
 }
 
@@ -615,39 +652,72 @@ export type Screenshots = {
   image: string | null;
   link: string | null;
   note: string | null;
+  // A fork, or a workflow that kept contents: read, links the crops by
+  // choice, so its note is a notice rather than a warning.
+  expected?: boolean;
 };
 
 const cropsAlt = 'Before, after and changed pixels, left to right';
 
-function screenshotSection(
+function changedScreens(
   result: Comparison,
-  screenshots: Screenshots | null,
-): string | null {
-  const lines = result.journeys.flatMap((journey) => {
+): { journey: Journey; change: string }[] {
+  return result.journeys.flatMap((journey) => {
     const change =
       journey.comparison.kind === 'available'
         ? visualChange(journey.comparison.visual)
         : null;
 
-    return change === null
-      ? []
-      : [
-          `**Screenshots${result.journeys.length === 1 ? '' : ` · ${inlineText(journey.title)}`}** · ${inlineText(change)} An observation, not a check.`,
-        ];
+    return change === null ? [] : [{ journey, change }];
   });
+}
+
+// One line however many journeys changed; the crops image has a row for
+// each. The link stays beside an image, since a reader who cannot load the
+// image can still open it.
+function screenshotSection(
+  result: Comparison,
+  screenshots: Screenshots | null,
+): string | null {
   const image = httpsUrl(screenshots?.image);
   const file = httpsUrl(screenshots?.link);
+  const changed = changedScreens(result);
+  const [only] = changed;
 
-  if (lines.length === 0) {
+  if (only === undefined) {
     return null;
   }
 
-  return [
-    ...lines,
-    ...(image === null
-      ? extra(file === null ? null : `[${cropsAlt}](${file})`)
-      : [`![${cropsAlt}](${image})`]),
-  ].join('\n\n');
+  const line = [
+    changed.length > 1
+      ? `**Screenshots** · ${changed.length} journeys changed: ${changed.map(({ journey }) => inlineText(journey.title)).join(', ')}.`
+      : `**Screenshots${result.journeys.length === 1 ? '' : ` · ${inlineText(only.journey.title)}`}** · ${inlineText(only.change)}`,
+    ...(file === null ? [] : [`[${cropsAlt}](${file})`]),
+  ].join(' ');
+
+  return [line, ...(image === null ? [] : [`![${cropsAlt}](${image})`])].join(
+    '\n\n',
+  );
+}
+
+function screenshotDetails(result: Comparison): string | null {
+  const changed = changedScreens(result);
+
+  return changed.length === 0
+    ? null
+    : [
+        'An observation, not a check.',
+        ...(changed.length === 1
+          ? []
+          : [
+              changed
+                .map(
+                  ({ journey, change }) =>
+                    `- ${inlineText(journey.title)}: ${inlineText(change)}`,
+                )
+                .join('\n'),
+            ]),
+      ].join('\n\n');
 }
 
 // Why changed screenshots have no crops to show, such as a crop step that
@@ -805,6 +875,22 @@ function collapsed(summary: string, body: string): string {
     '',
     '</details>',
   ].join('\n');
+}
+
+// Everything after the report link sits in one collapsed block, whose summary
+// names what it holds.
+function details(
+  parts: readonly (readonly [string, string, string | null | undefined])[],
+): string {
+  const shown = parts.filter(
+    (part): part is readonly [string, string, string] =>
+      part[2] !== null && part[2] !== undefined,
+  );
+
+  return collapsed(
+    `Details: ${shown.map(([name]) => name).join(', ')}`,
+    shown.map(([, heading, body]) => `**${heading}**\n\n${body}`).join('\n\n'),
+  );
 }
 
 const promptedChecks = 10;
@@ -996,6 +1082,11 @@ function resultSummary(frame: Frame, result: Comparison): Summary {
   const cropsNote = screenshotsNote(result, options.screenshots ?? null);
   const scoped =
     result.mode === 'preview' ? null : scopeView(result, frame.files);
+  const passedCount = result.journeys.reduce(
+    (sum, journey) =>
+      sum + journey.checks.filter((check) => check.verdict === 'passed').length,
+    0,
+  );
 
   const markdown = [
     agentBlock(result, { artifact: frame.artifact, run: options.run ?? null }),
@@ -1016,44 +1107,51 @@ function resultSummary(frame: Frame, result: Comparison): Summary {
     ...extra(reasons.length === 0 ? null : reasons.join('\n')),
     ...extra(screenshotSection(result, options.screenshots ?? null)),
     ...extra(scoped?.table),
-    ...extra(recipeList(result)),
     page === null
       ? `No report page was uploaded. ${bundle}`
       : `**[Open the report](${page})**`,
-    ...extra(scoped?.details),
-    ...extra(passedChecks(result)),
-    ...(open.length === 0 && kind !== 'unavailable'
-      ? []
-      : [
-          collapsed(
-            'Prompt for your agent',
-            fenced(
+    details([
+      ['screenshots', 'Screenshots', screenshotDetails(result)],
+      ['files', 'What touched each file', scoped?.details],
+      ['journey changes', 'Changes to journeys and checks', recipeList(result)],
+      [
+        passedCount === 1 ? '1 passing check' : `${passedCount} passing checks`,
+        'What the passing checks covered',
+        passedChecks(result),
+      ],
+      [
+        'agent prompt',
+        'Prompt for your agent',
+        open.length === 0 && kind !== 'unavailable'
+          ? null
+          : fenced(
               agentPrompt(result, {
                 artifact: frame.artifact,
                 download: options.download ?? null,
               }),
             ),
-          ),
-        ]),
-    collapsed(
-      'Run details and limits',
+      ],
       [
-        ...(failures.length > 0 && !allFailed ? unavailableReasons : []),
-        ...extra(unchanged(result)),
-        ...extra(cropsNote === null ? null : inlineText(cropsNote)),
-        ...conditionsLines(result).map(inlineText),
-        ...limitations.map(inlineText),
-        ...(page === null
-          ? []
-          : [
-              'The report opens for signed-in users who can read this repository, until the artifact expires.',
-              bundle,
-            ]),
-        `Observed exited with code ${formatExit(options.exitCode)}.`,
-      ]
-        .map((item) => `- ${item}`)
-        .join('\n'),
-    ),
+        'run limits',
+        'Run details and limits',
+        [
+          ...(failures.length > 0 && !allFailed ? unavailableReasons : []),
+          ...extra(unchanged(result)),
+          ...extra(cropsNote === null ? null : inlineText(cropsNote)),
+          ...conditionsLines(result).map(inlineText),
+          ...limitations.map(inlineText),
+          ...(page === null
+            ? []
+            : [
+                'The report opens for signed-in users who can read this repository, until the artifact expires.',
+                bundle,
+              ]),
+          `Observed exited with code ${formatExit(options.exitCode)}.`,
+        ]
+          .map((item) => `- ${item}`)
+          .join('\n'),
+      ],
+    ]),
     ...(options.artifact === defaultArtifact
       ? []
       : [`<sub>${inlineText(checkName(options.artifact))}</sub>`]),
@@ -1419,18 +1517,22 @@ function commentMode(value: string): {
       };
 }
 
-// An earlier step uploaded the crops as a workflow artifact. A user token
-// also uploads them for the comment to show; any failure keeps the link and
-// says why.
-// Uploads only for a trusted result that will be commented on, so the
-// token's user never publishes images nobody shows.
+// An earlier step uploaded the crops as a workflow artifact. For the comment
+// to show them, the workflow token commits them to a ref outside refs/heads,
+// or a user token uploads them; any failure keeps the link and says why.
+// Nothing is stored unless a trusted result will be commented on, and never
+// for a fork, whose pixels the repository did not choose to keep.
 export async function deliveredScreenshots(options: {
   trusted: boolean;
   commenting: boolean;
+  fork: boolean;
   path: string;
   link: string;
-  token: string;
+  target: Target;
   server: string;
+  ref: string;
+  cutoff: string | null;
+  userToken: string;
   repositoryId: string;
 }): Promise<Screenshots | null> {
   if (!options.trusted || options.path === '') {
@@ -1439,35 +1541,141 @@ export async function deliveredScreenshots(options: {
 
   const link = options.link === '' ? null : options.link;
 
-  if (options.token === '' || !options.commenting) {
+  if (!options.commenting) {
     return { image: null, link, note: null };
   }
 
-  try {
+  if (options.fork) {
     return {
-      image: await uploadImage({
-        server: options.server,
-        token: options.token,
-        repositoryId: options.repositoryId,
-        name: path.basename(options.path),
-        bytes: await readFile(options.path),
-      }),
+      image: null,
       link,
-      note: null,
+      note: 'The comment links the screenshot crops: Observed stores no images from pull requests from forks.',
+      expected: true,
     };
+  }
+
+  const name = path.basename(options.path);
+  let bytes: Uint8Array;
+
+  try {
+    bytes = await readFile(options.path);
   } catch (error) {
-    if (!(error instanceof DeliveryError)) {
-      process.stderr.write(
-        `Observed: the image upload failed: ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}\n`,
-      );
-    }
+    process.stderr.write(
+      `Observed: the screenshot crops could not be read: ${describeError(error)}\n`,
+    );
 
     return {
       image: null,
       link,
-      note: `The comment does not show the screenshot crops. ${error instanceof DeliveryError ? `${error.message}.` : 'An unexpected error; the job log has details.'}`,
+      note: 'The comment links the screenshot crops. Their file could not be read; the job log has details.',
     };
   }
+
+  let refused: unknown;
+
+  try {
+    const image = await commitImage(options.target, {
+      server: options.server,
+      ref: options.ref,
+      name,
+      bytes,
+    });
+    const { cutoff } = options;
+
+    if (cutoff !== null) {
+      await pruneImages(options.target, cutoff).catch((error: unknown) =>
+        process.stderr.write(
+          `Observed: old screenshot refs were not pruned: ${describeError(error)}\n`,
+        ),
+      );
+    }
+
+    return { image, link, note: null };
+  } catch (error) {
+    refused = error;
+  }
+
+  if (options.userToken !== '') {
+    try {
+      return {
+        image: await uploadImage({
+          server: options.server,
+          token: options.userToken,
+          repositoryId: options.repositoryId,
+          name,
+          bytes,
+        }),
+        link,
+        note: null,
+      };
+    } catch (error) {
+      refused = error;
+    }
+  }
+
+  if (!(refused instanceof DeliveryError)) {
+    process.stderr.write(
+      `Observed: the screenshot crops were not stored: ${describeError(refused)}\n`,
+    );
+  }
+
+  return {
+    image: null,
+    link,
+    note: imageRefusal(refused, options.userToken !== ''),
+    expected:
+      options.userToken === '' &&
+      refused instanceof DeliveryError &&
+      refused.status === 403,
+  };
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : String(error);
+}
+
+function imageRefusal(error: unknown, userToken: boolean): string {
+  if (!(error instanceof DeliveryError)) {
+    return 'The comment links the screenshot crops. Storing them failed unexpectedly; the job log has details.';
+  }
+
+  return !userToken && error.status === 403
+    ? "The comment links the screenshot crops because the workflow token cannot write to this repository. Add contents: write to the workflow's permissions to show them."
+    : `The comment links the screenshot crops. ${error.message}.`;
+}
+
+// One ref per run attempt and comment, under the day it was stored.
+export function imageRef(
+  now: Date,
+  run: { run: string; attempt: string; artifact: string },
+): string {
+  // Other characters become .xx, so two artifact names never share a ref.
+  const artifact = [...run.artifact]
+    .map((character) =>
+      /[A-Za-z0-9_-]/.test(character)
+        ? character
+        : [...Buffer.from(character)]
+            .map((byte) => `.${byte.toString(16).padStart(2, '0')}`)
+            .join(''),
+    )
+    .join('');
+
+  return `${imageRefPrefix}${now.toISOString().slice(0, 10)}/${run.run}-${run.attempt}-${artifact}`;
+}
+
+// Refs stored before this day are older than the artifacts they stand in for.
+// Nothing is pruned without a retention in days: 0 asks upload-artifact for
+// the repository's default, which the action cannot read.
+export function imageCutoff(now: Date, retentionDays: string): string | null {
+  const days = retentionDays.trim();
+
+  return /^[1-9]\d*$/.test(days)
+    ? new Date(now.getTime() - Number(days) * 86_400_000)
+        .toISOString()
+        .slice(0, 10)
+    : null;
 }
 
 function link(label: string, url: string | null): string | null {
@@ -1762,22 +1970,31 @@ if (import.meta.main) {
       process.exit(0);
     }
 
+    const now = new Date();
     const screenshots = await deliveredScreenshots({
       trusted:
         Option.isSome(decoded) &&
         context.exitCode ===
           conclusionExitCodes[decoded.value.result.conclusion.kind],
       commenting,
+      fork: source === 'fork',
       path: environment('OBSERVED_CROPS_PATH'),
       link: environment('OBSERVED_CROPS_URL'),
-      token: source === 'fork' ? '' : environment('OBSERVED_IMAGE_TOKEN'),
+      target: workflow,
       server: environment('GITHUB_SERVER_URL'),
+      ref: imageRef(now, {
+        run: environment('GITHUB_RUN_ID'),
+        attempt: environment('GITHUB_RUN_ATTEMPT'),
+        artifact,
+      }),
+      cutoff: imageCutoff(now, environment('OBSERVED_RETENTION_DAYS')),
+      userToken: source === 'fork' ? '' : environment('OBSERVED_IMAGE_TOKEN'),
       repositoryId: environment('GITHUB_REPOSITORY_ID'),
     });
 
     if (screenshots?.note !== null && screenshots?.note !== undefined) {
       process.stdout.write(
-        `::warning title=Observed::${escapeCommand(screenshots.note)}\n`,
+        `::${screenshots.expected === true ? 'notice' : 'warning'} title=Observed::${escapeCommand(screenshots.note)}\n`,
       );
       notes.push(screenshots.note);
     } else if (
