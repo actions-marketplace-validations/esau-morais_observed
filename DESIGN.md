@@ -123,15 +123,15 @@ Relation chips use the evidence colors. Only "Checked" uses the checked color, b
 | Not observed | unknown | ? |
 | Outside the captured source | unknown | ∅ |
 
-Each connection type has its own color and line pattern, so the type survives without color. The legend shows both. Every color has at least 5.3:1 against canvas, surface, and muted surface in its theme.
+Each connection type has its own color and line pattern, so the type survives without color. The legend shows both. The five colors pass the dataviz palette validator (2026-10-03) in both themes with every pair compared: OKLab ΔE at least 11 under protanopia and deuteranopia and at least 15 with normal vision. Each has at least 3:1 against canvas, surface, and muted surface, the non-text minimum. The imports neutral is a deliberate gray, so it falls outside the validator's categorical lightness and chroma bands. Connection words in text use text tokens beside a colored line sample, never the line color.
 
 | Connection | Light | Dark | Pattern |
 | --- | --- | --- | --- |
-| Imports | #45595E | #C0CDCC | Solid |
-| Ran in | #276A6A | #86C9C0 | Dash 7 4 |
-| Requested | #80570F | #E1C17A | Dot 2 4 |
-| Threw at | #8E3B63 | #EBA3C4 | Dash-dot 9 3 2 3 |
-| Checked by | #3D4F99 | #AFC0F5 | Long dash 14 4 |
+| Imports | #233236 | #C0CDCC | Solid |
+| Ran in | #0F927E | #4EA988 | Dash 7 4 |
+| Requested | #9E6E1A | #D36D00 | Dot 2 4 |
+| Threw at | #75386D | #AA56AE | Dash-dot 9 3 2 3 |
+| Checked by | #1D56B9 | #6573F4 | Long dash 14 4 |
 | Import the change removed | Imports color | Imports color | Round dots 1 5 |
 
 ### Contrast baseline
@@ -279,8 +279,9 @@ Use the Pixel focus composition as the default: centered headline, one pixel wor
 ### Evidence viewer
 
 A comparison with a change scope opens on the
-[change map](docs/PRODUCT.md#change-map), with a side panel on the evidence
-that explains the verdict. A preview, or a comparison without a change scope,
+[change map](docs/PRODUCT.md#change-map) at full width, when a captured file
+changed; its side panel opens on selection, and Details opens it on the
+evidence that explains the verdict. A preview, or a comparison without a change scope,
 starts with the captured application. Show both versions when a comparison was
 requested; otherwise show the standalone capture. Keep the page name, selected
 revisions, and unavailable captures visible. Keep checks, requests, and source
@@ -289,7 +290,7 @@ check must not imply a pass.
 
 Inside the side panel, a code diff, screenshot, replay, request list, timing comparison, or state transition can each be the primary view. Pick the view that explains this change; do not force every case into a component tree or network graph.
 
-On the map, use the evidence colors for relation chips and one color per connection type, each with a distinct line pattern so the type survives without color. Dim unrelated blocks on hover rather than hiding them. Every block and connection is reachable by keyboard in reading order, Enter opens a directory, and Escape goes up. Agent descriptions use the inference color and an "Agent description" label.
+On the map, use the evidence colors for relation chips and one color per connection type, each with a distinct line pattern so the type survives without color. Dim unrelated blocks on hover rather than hiding them. Every block is reachable by keyboard in reading order, and every connection through the selected block's panel and the Files view. Enter opens a directory, and Escape closes the panel, then a fold, then goes up. Agent descriptions use the inference color and an "Agent description" label.
 
 ### Mobile and shared reports
 
