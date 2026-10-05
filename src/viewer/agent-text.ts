@@ -1,3 +1,4 @@
+import { savingProposalText } from '../generated-proposals';
 import { repositoryPath, scopeLine } from '../change-scope-text';
 import type {
   ChangeScope,
@@ -83,6 +84,17 @@ function journeyText(
       : [];
 
   return [
+    ...(journey.generated === undefined
+      ? []
+      : [
+          'Generated journey · Agent interpretation.',
+          journey.generated.reason,
+          `Targets: ${journey.generated.targets.join(', ')}. Only executed baseline checks set verdicts.`,
+          savingProposalText(journey),
+        ]),
+    ...journey.findings
+      .filter((finding) => finding.evidence === 'text')
+      .map((finding) => `Observation: ${finding.subject}. No verdict.`),
     ...sides.map(({ label, side }) => identity(label, side)),
     '',
     `${level} Checks`,

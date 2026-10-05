@@ -1,5 +1,5 @@
 import { Option, Schema } from 'effect';
-import { recipeSchema } from './capture/recipe';
+import { generatedOriginSchema, recipeSchema } from './capture/recipe';
 import { journeySchema as projectJourneySchema } from './project';
 import { evidenceViewSchema } from './evidence-kinds';
 import {
@@ -309,6 +309,13 @@ export type Finding = typeof findingSchema.Type;
 
 export const journeySchema = Schema.Struct({
   title: text,
+  generated: Schema.optionalKey(generatedOriginSchema),
+  savingProposal: Schema.optionalKey(
+    Schema.Struct({
+      action: Schema.Literals(['save', 'replace']),
+      files: Schema.NonEmptyArray(text),
+    }),
+  ),
   base: sideSchema,
   candidate: sideSchema,
   comparison: Schema.Union([
@@ -757,6 +764,9 @@ export type SideArtifact = Side['artifacts'][number];
 
 const journeySelectionSchema = Schema.Struct({
   directory: text.check(Schema.isPattern(/^journey-[1-9][0-9]*$/)),
+  generated: Schema.optionalKey(
+    Schema.Struct({ name: text, ...generatedOriginSchema.fields }),
+  ),
   baseIssue: Schema.optionalKey(text),
   candidateIssue: Schema.optionalKey(text),
   baseFailureArtifacts: Schema.optionalKey(Schema.Array(captureArtifactSchema)),

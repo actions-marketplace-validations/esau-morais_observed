@@ -1,6 +1,7 @@
 import { Schema } from 'effect';
 import type { EvidenceKind } from '../evidence-kinds';
 import type { CheckKind } from './define';
+import { baselineBrowserErrors, baselineServerErrors } from './baseline';
 import { accessibility } from './accessibility';
 import { apiReadback, apiSchema, apiStatus } from './api';
 import { performance } from './performance';
@@ -9,7 +10,7 @@ import { browserErrors } from './browser-errors';
 import { requestCount } from './request-count';
 import { text } from './text';
 
-export const checkSchema = Schema.Union([
+export const savedCheckSchema = Schema.Union([
   requestCount.definition,
   text.definition,
   reactRenders.definition,
@@ -19,6 +20,12 @@ export const checkSchema = Schema.Union([
   apiStatus.definition,
   apiSchema.definition,
   apiReadback.definition,
+]);
+
+export const checkSchema = Schema.Union([
+  savedCheckSchema,
+  baselineBrowserErrors.definition,
+  baselineServerErrors.definition,
 ]);
 
 export type CheckDefinition = typeof checkSchema.Type;
@@ -31,6 +38,8 @@ export type CheckKinds = {
 };
 
 export const checkKinds: CheckKinds = {
+  'baseline-browser-errors': baselineBrowserErrors,
+  'baseline-server-errors': baselineServerErrors,
   'request-count': requestCount,
   text,
   'react-renders': reactRenders,

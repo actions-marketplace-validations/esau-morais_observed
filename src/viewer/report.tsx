@@ -1,5 +1,6 @@
+import { generatedCoverage, savingProposalText } from '../generated-proposals';
 import * as stylex from '@stylexjs/stylex';
-import { createContext, use, type ReactNode } from 'react';
+import { createContext, use, useMemo, type ReactNode } from 'react';
 import type {
   ChangeScope,
   CheckVerdict,
@@ -60,6 +61,8 @@ import { EvidenceSection } from './sections';
 import { RenderTree, type ComponentSource } from './sections/react';
 import { PerformanceSection } from './sections/performance';
 import { Steps } from './sections/timeline';
+import { SceneView } from './scene';
+import { sceneOf } from './scene-model';
 import { ThemeControl, useTheme } from './theme';
 import { colors } from './tokens.stylex';
 
@@ -350,6 +353,7 @@ const styles = stylex.create({
     color: colors.regression,
   },
   unknown: { backgroundColor: colors.unknownFill, color: colors.unknown },
+  inference: { backgroundColor: colors.inferenceFill, color: colors.inference },
   inkRegression: { color: colors.regression },
   inkUnknown: { color: colors.unknown },
   inkChecked: { color: colors.checked },
@@ -1391,6 +1395,9 @@ function JourneyView({
   const level = multiple ? 3 : 2;
   const tone = conclusionTones[journey.conclusion.kind];
   const titleId = `journey-${index + 1}-title`;
+  const scope = use(ChangeScopeContext);
+  const scene = useMemo(() => sceneOf(journey, scope), [journey, scope]);
+  const coverage = generatedCoverage(journey);
   const journeyLead =
     journey.conclusion.kind === 'no-regression'
       ? withoutPlainPasses(
@@ -1424,6 +1431,27 @@ function JourneyView({
           )}
         </div>
       ) : null}
+      {journey.generated === undefined ? null : (
+        <p {...stylex.props(styles.text, styles.inference)}>
+          Generated journey · Agent interpretation. {journey.generated.reason}{' '}
+          Targets: {journey.generated.targets.join(', ')}. Only executed
+          baseline checks set verdicts. {savingProposalText(journey)}
+          {coverage === null ? null : (
+            <>
+              {' '}
+              <EvidenceLink href={coverage}>Recorded coverage</EvidenceLink>.
+            </>
+          )}
+        </p>
+      )}
+      {journey.findings
+        .filter((finding) => finding.evidence === 'text')
+        .map((finding) => (
+          <p key={finding.id} {...stylex.props(styles.text)}>
+            Observation: {finding.subject}. No verdict.
+          </p>
+        ))}
+      {scene === null ? null : <SceneView scene={scene} level={level} />}
       <div {...stylex.props(styles.disclosures)}>
         {outline.sections.map((section) => (
           <Disclosure
