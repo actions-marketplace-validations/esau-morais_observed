@@ -1,6 +1,6 @@
 import { Option, Schema } from 'effect';
-import { repositoryPath, scopeLine } from '../src/change-scope-text';
-import type { CheckVerdict, Comparison, Side } from '../src/comparison-model';
+import { scopeLine } from '../src/change-scope-text';
+import type { Comparison, Side } from '../src/comparison-model';
 import { shortSource } from '../src/provenance-text';
 import {
   anchorLocation,
@@ -10,6 +10,12 @@ import {
   leadingChecks,
   type Tone,
 } from '../src/result-text';
+import {
+  checkCount,
+  clip,
+  notObservedPaths,
+  type ChatLinks,
+} from './chat-delivery';
 
 export class SlackError extends Schema.TaggedError<SlackError>()('SlackError', {
   message: Schema.String,
@@ -40,10 +46,6 @@ export function slackText(value: string): string {
     .replaceAll('>', '&gt;');
 }
 
-function clip(value: string, length: number): string {
-  return value.length <= length ? value : `${value.slice(0, length - 1)}…`;
-}
-
 const httpsUrl = Schema.String.check(Schema.isPattern(/^https:\/\/[^\s<>|]+$/));
 
 function slackLink(label: string, url: string | null): string | null {
@@ -51,14 +53,6 @@ function slackLink(label: string, url: string | null): string | null {
     ? `<${url}|${slackText(label).replaceAll('|', '/')}>`
     : null;
 }
-
-export type SlackLinks = {
-  name: string;
-  pullRequest: string | null;
-  pullRequestLabel: string;
-  report: string | null;
-  run: string | null;
-};
 
 function revision(side: Side | undefined): string {
   if (side?.capture === null || side?.capture === undefined) {
@@ -72,55 +66,12 @@ function revision(side: Side | undefined): string {
     : `${commit} (${executionLabels[side.execution].toLowerCase()})`;
 }
 
-// "N of M" names the checks that decided the verdict.
-function checkCount(result: Comparison): string {
-  const verdicts = result.journeys.flatMap((journey) => journey.checks);
-  const total = verdicts.length;
-  const count = (kinds: readonly CheckVerdict['verdict'][]) =>
-    verdicts.filter((check) => kinds.includes(check.verdict)).length;
-  const noun = total === 1 ? 'check' : 'checks';
-
-  if (total === 0) {
-    return 'no named checks';
-  }
-
-  switch (result.conclusion.kind) {
-    case 'regression':
-    case 'check-failed': {
-      const unknown = count(['unknown']);
-      const notRun = count(['not-run']);
-
-      return `${count(['regression', 'failed'])} of ${total} ${noun} failed${unknown === 0 ? '' : `, ${unknown} unknown`}${notRun === 0 ? '' : `, ${notRun} not run`}`;
-    }
-    case 'unavailable': {
-      const unknown = count(['unknown']);
-      const notRun = count(['not-run']);
-
-      return unknown === 0
-        ? `${notRun} of ${total} ${noun} not run`
-        : `${unknown} of ${total} ${noun} unknown${notRun === 0 ? '' : `, ${notRun} not run`}`;
-    }
-    case 'no-regression':
-    case 'not-checked':
-    case 'preview':
-      return `${count(['passed'])} of ${total} ${noun} passed`;
-  }
-}
-
-// Paths only: a file's reason can quote coverage tool output.
 function scopeText(result: Comparison): string[] {
-  const scope = result.changeScope;
-
   if (result.mode === 'preview') {
     return [];
   }
 
-  const paths =
-    scope.kind === 'recorded'
-      ? scope.files.flatMap((file) =>
-          file.relation === 'not-observed' ? [repositoryPath(scope, file)] : [],
-        )
-      : [];
+  const paths = notObservedPaths(result);
   const shown = paths
     .slice(0, 5)
     .map((path) => `\`${slackText(path)}\``)
@@ -128,7 +79,7 @@ function scopeText(result: Comparison): string[] {
   const more = paths.length > 5 ? ` and ${paths.length - 5} more` : '';
 
   return [
-    slackText(scopeLine(scope)),
+    slackText(scopeLine(result.changeScope)),
     ...(paths.length === 0 ? [] : [`Not observed: ${shown}${more}`]),
   ];
 }
@@ -162,7 +113,7 @@ function location(result: Comparison): string {
     : ` · ${found.words} \`${slackText(found.place)}\``;
 }
 
-export function slackMessage(result: Comparison | null, links: SlackLinks) {
+export function slackMessage(result: Comparison | null, links: ChatLinks) {
   const title = clip(
     result === null
       ? 'No result: treat this run as unavailable'
@@ -254,27 +205,6 @@ export function readSlackState(body: string | null): SlackState | null {
 
 export function writeSlackState(state: SlackState): string {
   return `<!-- observed-slack:${state.channel}/${state.ts}/${state.failing ? 'failing' : 'passing'} -->`;
-}
-
-// Edits notify nobody, so only a newly failing result posts a new message,
-// and a failing message that turns into no regression also gets a reply in
-// its thread.
-export function slackAction(
-  previous: SlackState | null,
-  channel: string,
-  result: { failing: boolean; passed: boolean },
-): 'post' | 'update' | 'recover' | 'none' {
-  const known = previous?.channel === channel ? previous : null;
-
-  if (result.failing && (known === null || !known.failing)) {
-    return 'post';
-  }
-
-  if (known === null) {
-    return 'none';
-  }
-
-  return known.failing && result.passed ? 'recover' : 'update';
 }
 
 const answerSchema = Schema.Struct({
