@@ -35,7 +35,9 @@ import {
   uploadImage,
   writeComment,
 } from './github-delivery';
+import { sceneGif } from './scene-gif';
 import { screenshotCrops } from './screenshot-crops';
+import { exportedScene } from '../src/viewer/scene-model';
 import { statusWords } from '../src/status-words';
 import { sha256 } from '../src/encoding';
 import {
@@ -706,6 +708,30 @@ function screenshotSection(
   );
 }
 
+// The scene's alternative text: the verdict it ends on.
+export function sceneAlt(result: Comparison): string | null {
+  const exported = exportedScene(result);
+  const verdict = exported?.scene.beats.findLast(
+    (beat) => beat.phase === 'candidate',
+  );
+
+  return exported === null
+    ? null
+    : `Scene drawn from this run's evidence, after Kit Langton's PR explainers. ${verdict?.caption ?? ''}`
+        .replace(/[[\]]/g, '')
+        .trim();
+}
+
+function sceneSection(
+  result: Comparison,
+  image: string | null | undefined,
+): string | null {
+  const url = httpsUrl(image);
+  const alt = sceneAlt(result);
+
+  return url === null || alt === null ? null : `![${alt}](${url})`;
+}
+
 function screenshotDetails(result: Comparison): string | null {
   const changed = changedScreens(result);
 
@@ -1005,6 +1031,7 @@ export type SummaryOptions = {
   repository?: string | null;
   delivery?: string | null;
   screenshots?: Screenshots | null;
+  scene?: SceneImage | null;
   run?: string | null;
   download?: string | null;
   sourceBuild?: { commit: string | null } | null;
@@ -1109,6 +1136,7 @@ function resultSummary(frame: Frame, result: Comparison): Summary {
         : [inlineText(scopeLine(result.changeScope))]),
       ...extra(recipeSummary === null ? null : inlineText(recipeSummary)),
     ]),
+    ...extra(sceneSection(result, options.scene?.image)),
     ...result.journeys.flatMap((journey) =>
       journey.generated === undefined
         ? []
@@ -1164,6 +1192,11 @@ function resultSummary(frame: Frame, result: Comparison): Summary {
           ...(failures.length > 0 && !allFailed ? unavailableReasons : []),
           ...extra(unchanged(result)),
           ...extra(cropsNote === null ? null : inlineText(cropsNote)),
+          ...extra(
+            options.scene?.note === undefined || options.scene.note === null
+              ? null
+              : inlineText(options.scene.note),
+          ),
           ...conditionsLines(result).map(inlineText),
           ...limitations.map(inlineText),
           ...(page === null
@@ -1630,6 +1663,7 @@ export async function deliveredScreenshots(options: {
           repositoryId: options.repositoryId,
           name,
           bytes,
+          contentType: 'image/png',
         }),
         link,
         note: null,
@@ -1670,6 +1704,120 @@ function imageRefusal(error: unknown, userToken: boolean): string {
   return !userToken && error.status === 403
     ? "The comment links the screenshot crops because the workflow token cannot write to this repository. Add contents: write to the workflow's permissions to show them."
     : `The comment links the screenshot crops. ${error.message}.`;
+}
+
+export type SceneImage = {
+  image: string | null;
+  note: string | null;
+  // A fork or a token without contents: write leaves the scene out by
+  // choice, so its note is a notice rather than a warning.
+  expected?: boolean;
+};
+
+// The scene GIF goes where the crops go: a ref outside refs/heads with the
+// workflow token, or an upload as the user. It has no artifact link to fall
+// back on, so a failure leaves only a note.
+export async function deliveredScene(options: {
+  trusted: boolean;
+  commenting: boolean;
+  fork: boolean;
+  path: string;
+  target: Target;
+  server: string;
+  ref: string;
+  cutoff: string | null;
+  userToken: string;
+  repositoryId: string;
+}): Promise<SceneImage | null> {
+  if (!options.trusted || !options.commenting || options.path === '') {
+    return null;
+  }
+
+  if (options.fork) {
+    return {
+      image: null,
+      note: 'The comment has no scene: Observed stores no images from pull requests from forks.',
+      expected: true,
+    };
+  }
+
+  let bytes: Uint8Array;
+
+  try {
+    bytes = await readFile(options.path);
+  } catch (error) {
+    process.stderr.write(
+      `Observed: the scene could not be read: ${describeError(error)}\n`,
+    );
+
+    return { image: null, note: 'The scene could not be read.' };
+  }
+
+  const name = path.basename(options.path);
+  let refused: unknown;
+
+  try {
+    const image = await commitImage(options.target, {
+      server: options.server,
+      ref: options.ref,
+      name,
+      bytes,
+    });
+    const { cutoff } = options;
+
+    // A failing run with unchanged screenshots stores no crops, so the scene
+    // prunes old refs too.
+    if (cutoff !== null) {
+      await pruneImages(options.target, cutoff).catch((error: unknown) =>
+        process.stderr.write(
+          `Observed: old image refs were not pruned: ${describeError(error)}\n`,
+        ),
+      );
+    }
+
+    return { image, note: null };
+  } catch (error) {
+    refused = error;
+  }
+
+  if (options.userToken !== '') {
+    try {
+      return {
+        image: await uploadImage({
+          server: options.server,
+          token: options.userToken,
+          repositoryId: options.repositoryId,
+          name,
+          bytes,
+          contentType: 'image/gif',
+        }),
+        note: null,
+      };
+    } catch (error) {
+      refused = error;
+    }
+  }
+
+  if (!(refused instanceof DeliveryError)) {
+    process.stderr.write(
+      `Observed: the scene was not stored: ${describeError(refused)}\n`,
+    );
+
+    return {
+      image: null,
+      note: 'The comment has no scene. Storing it failed unexpectedly; the job log has details.',
+    };
+  }
+
+  const readOnly = options.userToken === '' && refused.status === 403;
+
+  return {
+    image: null,
+    note: readOnly
+      ? "The comment has no scene because the workflow token cannot write to this repository. Add contents: write to the workflow's permissions to show it."
+      : `The comment has no scene. ${refused.message}.`,
+    expected: readOnly,
+  };
 }
 
 // One ref per run attempt and comment, under the day it was stored.
@@ -2039,10 +2187,43 @@ if (import.meta.main) {
     await writeOutput('image', screenshots?.image ?? '');
     await writeOutput('image-note', screenshots?.note ?? '');
 
+    const scene = await deliveredScene({
+      trusted:
+        Option.isSome(decoded) &&
+        context.exitCode ===
+          conclusionExitCodes[decoded.value.result.conclusion.kind],
+      commenting,
+      fork: source === 'fork',
+      path: environment('OBSERVED_SCENE_PATH'),
+      target: workflow,
+      server: environment('GITHUB_SERVER_URL'),
+      ref: `${imageRef(now, {
+        run: environment('GITHUB_RUN_ID'),
+        attempt: environment('GITHUB_RUN_ATTEMPT'),
+        artifact,
+      })}-scene`,
+      cutoff: imageCutoff(now, environment('OBSERVED_RETENTION_DAYS')),
+      userToken: source === 'fork' ? '' : environment('OBSERVED_IMAGE_TOKEN'),
+      repositoryId: environment('GITHUB_REPOSITORY_ID'),
+    });
+
+    if (scene?.note !== null && scene?.note !== undefined) {
+      process.stdout.write(
+        `::${scene.expected === true ? 'notice' : 'warning'} title=Observed::${escapeCommand(scene.note)}\n`,
+      );
+      notes.push(scene.note);
+    } else if (scene?.image !== null && scene?.image !== undefined) {
+      notes.push('Showed the scene in the comment');
+    }
+
+    await writeOutput('scene-image', scene?.image ?? '');
+    await writeOutput('scene-note', scene?.note ?? '');
+
     const summary = summarize({
       output,
       ...context,
       screenshots,
+      scene,
       surface: { kind: 'comment' },
     });
 
@@ -2225,6 +2406,27 @@ if (import.meta.main) {
             if (uploaded !== null) {
               notes.push(...extra(imageNotes[uploaded]));
             }
+
+            const scenePath = environment('OBSERVED_SCENE_PATH');
+
+            if (scenePath !== '') {
+              const added = await attempt('The Slack scene', async () =>
+                uploadSlackImage(slackToken, {
+                  channel: sent.channel,
+                  threadTs: sent.ts,
+                  filename: 'observed-scene.gif',
+                  title: 'Scene drawn from the run evidence',
+                  altText:
+                    sceneAlt(trusted.result) ??
+                    'Scene drawn from the run evidence',
+                  bytes: await readFile(scenePath),
+                }),
+              );
+
+              if (added === 'uploaded') {
+                notes.push('Slack: added the scene to the thread');
+              }
+            }
           }
         }
       }
@@ -2319,6 +2521,7 @@ if (import.meta.main) {
               output,
               ...context,
               screenshots,
+              scene,
               surface: { kind: 'check' },
               delivery: deliveryLine(
                 titled({ kind: 'posted', url: null }),
@@ -2334,6 +2537,29 @@ if (import.meta.main) {
         } satisfies Delivered);
 
     await finish(titled(title), notes);
+  } else if (command === 'scene' && args.length === 3) {
+    const [page = '', resultFile = '', output = ''] = args;
+    const decoded = Schema.decodeUnknownOption(runOutputSchema)(
+      await readOptional(resultFile),
+    );
+
+    if (Option.isNone(decoded)) {
+      process.exit(0);
+    }
+
+    const drawn = await sceneGif({
+      page,
+      result: decoded.value.result,
+      output,
+      toolRoot: path.resolve(import.meta.dirname, '..'),
+    });
+
+    if (drawn.kind === 'written') {
+      process.stdout.write(
+        `Observed: drew the scene, ${String(drawn.frames)} frames, ${String(Math.round(drawn.bytes / 1024))} KB\n`,
+      );
+      await writeOutput('path', output);
+    }
   } else if (command === 'crops' && args.length === 2) {
     const [resultFile = '', output = ''] = args;
     const decoded = Schema.decodeUnknownOption(runOutputSchema)(
@@ -2367,6 +2593,10 @@ if (import.meta.main) {
               link: emptyAsNull(environment('OBSERVED_CROPS_URL')),
               note: emptyAsNull(environment('OBSERVED_IMAGE_NOTE')),
             },
+      scene: {
+        image: emptyAsNull(environment('OBSERVED_SCENE_IMAGE')),
+        note: emptyAsNull(environment('OBSERVED_SCENE_NOTE')),
+      },
       surface: { kind: 'job' },
       delivery: jobDelivery(environment('OBSERVED_DELIVERY_NOTE')),
     });
@@ -2381,7 +2611,7 @@ if (import.meta.main) {
     await writeOutput('trusted', String(summary.trusted));
   } else {
     process.stderr.write(
-      'Usage: github-action.ts preflight <project> | page <report-directory> <result.json> <output.html> | crops <result.json> <output.png> | summary|deliver <result.json> <exit-code> <artifact-name> <page-url>\n',
+      'Usage: github-action.ts preflight <project> | page <report-directory> <result.json> <output.html> | scene <page.html> <result.json> <output.gif> | crops <result.json> <output.png> | summary|deliver <result.json> <exit-code> <artifact-name> <page-url>\n',
     );
     process.exit(64);
   }
