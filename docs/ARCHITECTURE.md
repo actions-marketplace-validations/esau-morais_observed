@@ -333,8 +333,7 @@ Narration is not built. Kit Langton makes the explainers with [psychopomp](https
 
 ### Rendered diagrams
 
-Planned, after the gate 3 and gate 8 pairs land. When a comparison's changed
-files include Markdown whose `mermaid` fenced blocks differ, Observed reads
+When a comparison's changed files include Markdown whose `mermaid` fenced blocks differ, Observed reads
 each file from the base and candidate commits with Git, pairs the blocks by
 the nearest heading and their order under it, and renders each changed pair
 in agent-browser's Chrome. The page loads a pinned `mermaid` build bundled into
@@ -350,6 +349,41 @@ usually sit outside it. They never enter the change scope, a check, or the
 verdict. The comment shows each pair under the scope line, labeled
 "Observation", and a pull request whose diagrams did not change shows nothing
 for them.
+
+`run/report/diagrams.json` holds these observations beside `result.json`, bound
+to the hash of its schema-normalized content. Diagram schemas and producer
+details stay in the diagram adapter; the comparator and shared result types do not consume them. Each rendered
+artifact has a hash. The adapter reads the captured commit identities, so a
+branch moving during capture cannot select different diagrams. Delivery checks
+both identities and verifies the PNG before publishing it. Rendering conditions
+record the browser, platform, viewport, scale, locale, timezone, browser arguments,
+and renderer hash. Each rendered side records its effective Mermaid configuration
+and hash, theme, and computed SVG font family, including frontmatter overrides.
+The SVG and PNG canvas use the effective theme's background color, with white
+as the fallback when no valid color is provided. The browser resolves that color
+against white once, and both artifacts use the resulting opaque color.
+The adapter snapshots configuration as drawing begins, after Mermaid's diagram
+initializer runs and before its rendering scope clears. It temporarily wraps
+the writable renderer slot in the pinned build's diagram registry, restoring
+that slot in `finally`; renderer module exports remain untouched. Rebuilding
+configuration after rendering would lose initializer adjustments such as
+sequence wrapping. The internal registry import must be checked when upgrading
+Mermaid; its lifecycle was checked against the tagged
+[diagram construction](https://github.com/mermaid-js/mermaid/blob/mermaid%4012.1.0/packages/mermaid/src/Diagram.ts#L41)
+and [rendering source](https://github.com/mermaid-js/mermaid/blob/mermaid%4012.1.0/packages/mermaid/src/mermaidAPI.ts#L572)
+on 2026-10-05.
+Input over 50,000 characters is unavailable. The viewer and single-file report do not display diagrams yet; the raw bundle keeps both
+formats. A worktree candidate records "not run" because this adapter reads only
+committed Markdown. A renamed heading makes removed and added pairs; moving an
+unchanged heading preserves its pairs.
+
+The build bundles [Mermaid 12.1.0](https://github.com/mermaid-js/mermaid/releases/tag/mermaid%4012.1.0),
+checked on 2026-10-05, and includes its version and license with the bundled
+packages' notices. The page uses Mermaid's
+[strict security level](https://mermaid.js.org/config/usage#securitylevel), an
+isolated agent-browser session, and a content security policy that blocks
+network access from the diagram. Rendering failures are observations and never
+change the exit code.
 
 Prior art read on 2026-10-05. GitHub renders `mermaid` blocks in Markdown
 ([creating diagrams](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/creating-diagrams))
