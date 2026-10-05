@@ -1,4 +1,4 @@
-# GitHub and Slack reference
+# GitHub, Slack and Discord reference
 
 Details of the GitHub Action. The
 [README](../README.md#run-on-pull-requests) has the workflow to copy.
@@ -18,6 +18,7 @@ Details of the GitHub Action. The
 | `image-upload-token` | empty | A user's token that uploads the screenshot crops when `github-token` cannot store them. See [Screenshots in the comment](#screenshots-in-the-comment) |
 | `github-app-client-id`, `github-app-private-key` | empty | Sign the comment with your own GitHub App |
 | `slack-bot-token`, `slack-channel`, `slack-images` | empty, empty, `false` | Post failures to Slack |
+| `discord-bot-token`, `discord-channel`, `discord-images` | empty, empty, `false` | Post failures to Discord |
 | `job-outcome` | empty | Deprecated. It has no effect and prints a warning |
 
 `fetch-depth: 0` in the checkout step fetches the history that contains
@@ -58,7 +59,7 @@ before Observed's, pinned by full commit SHA:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - uses: esau-morais/observed@1d21e79bd7180b54a1e1cd9a1607114dce9e6f87 # v0.2.0-alpha.4
+      - uses: esau-morais/observed@b19393c598268adb68c3d90cdf92f0e683c216ee # v0.2.0-alpha.5
 ```
 
 ## Secrets
@@ -67,7 +68,7 @@ A journey that signs in reads its secret from an environment variable, as in
 `{ "env": "LOGIN_PASSWORD" }`. Pass the repository secret to the action step:
 
 ```yaml
-      - uses: esau-morais/observed@1d21e79bd7180b54a1e1cd9a1607114dce9e6f87 # v0.2.0-alpha.4
+      - uses: esau-morais/observed@b19393c598268adb68c3d90cdf92f0e683c216ee # v0.2.0-alpha.5
         env:
           LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
         with:
@@ -196,7 +197,7 @@ update it. The App needs no server or webhook.
 4. Pass both to the action, and keep `checks: write` in `permissions:`.
 
 ```yaml
-      - uses: esau-morais/observed@1d21e79bd7180b54a1e1cd9a1607114dce9e6f87 # v0.2.0-alpha.4
+      - uses: esau-morais/observed@b19393c598268adb68c3d90cdf92f0e683c216ee # v0.2.0-alpha.5
         with:
           project: .
           base: ${{ github.event.pull_request.base.sha }}
@@ -263,6 +264,40 @@ scope, the message goes out without the image and the job summary says why.
    ```yaml
              slack-bot-token: ${{ secrets.OBSERVED_SLACK_BOT_TOKEN }}
              slack-channel: ${{ vars.OBSERVED_SLACK_CHANNEL }}
+   ```
+
+## Discord
+
+Discord delivery follows the Slack rules above: one message when a pull
+request starts failing, edits on later runs, a reply when it recovers,
+nothing for forks, Dependabot or runs outside pull requests, and no captured
+text. The verdict line is the message text, so it is what a notification
+shows. The commits, the check count and the change scope follow it in an
+embed, with buttons for the report and the pull request.
+
+`discord-images: true` attaches the screenshot crops to the message itself.
+Each edit replaces them with the current run's crops, or removes them when
+the run has none. Without the Attach Files permission the message goes out
+without the image and the job summary says why.
+
+The action posts as a bot, not through a channel webhook, because a webhook
+cannot reply to a message. Without the reply, a recovery would read as an
+unrelated message in the channel.
+
+1. Create an application at https://discord.com/developers/applications and
+   copy the token from its **Bot** page. Store it as the repository secret
+   `OBSERVED_DISCORD_BOT_TOKEN`.
+2. Under **Installation**, add the bot to your server with the `bot` scope
+   and the View Channel, Send Messages and Read Message History permissions,
+   plus Attach Files for `discord-images`.
+3. Turn on **Developer Mode** in Discord's settings, right-click the channel
+   and choose **Copy Channel ID**. Store it as the repository variable
+   `OBSERVED_DISCORD_CHANNEL`.
+4. Add both to the action:
+
+   ```yaml
+             discord-bot-token: ${{ secrets.OBSERVED_DISCORD_BOT_TOKEN }}
+             discord-channel: ${{ vars.OBSERVED_DISCORD_CHANNEL }}
    ```
 
 ## Turn it off
