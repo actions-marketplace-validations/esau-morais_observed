@@ -331,6 +331,42 @@ Runtime dependencies stay limited to agent-browser, so neither tool ships in the
 
 Narration is not built. Kit Langton makes the explainers with [psychopomp](https://github.com/kitlangton/psychopomp). At 46fd612, read 2026-10-05, its default walkthrough narration uses Fish Audio, and a study in `scenes/pr-walkthrough/narration-v4/README.md` used an ElevenLabs Professional Voice Clone named `Kit Langton`, directed with bracketed cues. Neither file says which voice the published post used, and the post's replies could not be read. Observed would use only a stock voice or one the user supplies, never a clone of someone else. A narration track stays optional, and the scene stays complete with captions alone. The default script would be the captions' evidence sentences; a script an agent writes is interpretation and carries that label. Stock voices with whisper-to-shout control exist in [ElevenLabs v3 audio tags](https://elevenlabs.io/docs/best-practices/prompting/eleven-v3) and [Azure SSML speaking styles](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-synthesis-markup-voice). [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) runs offline under Apache-2.0, without that control.
 
+### Rendered diagrams
+
+Planned, after the gate 3 and gate 8 pairs land. When a comparison's changed
+files include Markdown whose `mermaid` fenced blocks differ, Observed reads
+each file from the base and candidate commits with Git, pairs the blocks by
+the nearest heading and their order under it, and renders each changed pair
+in agent-browser's Chrome. The page loads a pinned `mermaid` build bundled into
+`dist/` like the viewer, so the package gains no runtime dependency. The result
+records each pair as an observation with both commits, the file path, the
+mermaid version as the producer version, and an SVG and PNG for each side that has the block. A block
+that does not parse renders as unavailable on that side, with mermaid's error.
+A block with no partner was added or removed: the result renders the side that
+has it and marks the other side absent, which is not an error.
+
+Diagrams render whether or not the file is in `source.paths`, since docs
+usually sit outside it. They never enter the change scope, a check, or the
+verdict. The comment shows each pair under the scope line, labeled
+"Observation", and a pull request whose diagrams did not change shows nothing
+for them.
+
+Prior art read on 2026-10-05. GitHub renders `mermaid` blocks in Markdown
+([creating diagrams](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/creating-diagrams))
+and highlights prose changes in its rendered diff, without saying whether that
+diff renders diagrams
+([non-code files](https://docs.github.com/en/repositories/working-with-files/using-files/working-with-non-code-files)).
+[Read the Docs visual diff](https://docs.readthedocs.com/platform/stable/visual-diff.html)
+highlights changed sections without gating, on its hosted service.
+[CodeBoarding](https://github.com/CodeBoarding/CodeBoarding-action) posts a
+before-and-after architecture diagram but needs a model.
+[mermaid-cli](https://github.com/mermaid-js/mermaid-cli) renders through an
+existing Chrome given its path, which is the approach here. A renderer without
+a browser, such as
+[beautiful-mermaid](https://github.com/lukilabs/beautiful-mermaid), lays the
+graph out differently from GitHub, so its picture would not match what
+reviewers see.
+
 The planned `/observed` trigger runs only for a comment from a user with write access on a pull request from the same repository. Untrusted pull request code must never run where the GitHub App key or Slack token can be read. If one workflow cannot guarantee that, split it: an unprivileged capture uploads the result, and a privileged delivery started by `workflow_run` reads only that upload. Never use `pull_request_target`. If neither design is safe, fall back to a label trigger on `pull_request`.
 
 ## Code, skills, and AI
@@ -376,31 +412,247 @@ change:
 
 [ROADMAP.md](ROADMAP.md#mvp-release-gates) lists the gates.
 
-## Bounded repair, later
+## Verification harness, Phase 4
 
-Repair stays out of the first release. A repair loop drives a candidate toward
-passing checks, so it is only as sound as those checks. It starts once MVP
-gates 1 to 8 hold and does not wait for the pilot. Until then the evidence
-handoff prompt is the only repair aid. The same limits apply to recipe
-proposals. An agent that proposes a journey cannot also accept it.
+Planned for Phase 4. Not built.
+
+Observed works around a coding agent and never inside its loop. Claude Code,
+Codex, opencode or another agent owns the prompts, tool calls and edits.
+Observed owns what decides whether the agent's work counts. It runs the
+change, records what happened, holds the base revision's expectations, reruns
+independently, and decides when a loop may stop. Verdicts need no model.
+Nothing here starts before MVP gates 1 to 8 hold, because a loop is only as
+sound as the checks it drives toward. Until then the evidence handoff is the
+only repair aid. An agent that proposes a journey cannot also accept it.
 
 ```mermaid
 flowchart TD
-    C["Capture and compare"] --> U{"Usable evidence?"}
-    U -->|No| B["Report unknown or blocked"]
-    U -->|Yes| F{"Check failed?"}
-    F -->|No| S["Publish scoped result"]
-    F -->|Yes| P{"Authorized and within budget?"}
-    P -->|No| E["Report for decision"]
-    P -->|Yes| A["Existing agent patches isolated revision"]
-    A --> C
+    Z{"Started by a person, and allowed by the workflow in CI?"} -->|No| N["Do not run"]
+    Z -->|Yes| P["Pin base commit and starting recipe"]
+    P --> C["Capture and compare"]
+    C --> U{"Usable evidence?"}
+    U -->|No| B["Stop: unknown"]
+    U -->|Yes| A{"Recipe changed since the pin?"}
+    A -->|Yes| H["Stop: needs a person"]
+    A -->|No| F{"Passed?"}
+    F -->|Yes| W{"Unchanged since a failure?"}
+    W -->|Yes| L
+    W -->|No| R{"Rerun without an edit passes?"}
+    R -->|Yes| S["Stop: passed locally"]
+    R -->|No| L["Stop: flaky"]
+    F -->|No| G{"Budget left and progress?"}
+    G -->|No| E["Stop: report for decision"]
+    G -->|Yes| X["User's agent edits the worktree"]
+    X --> C
 ```
 
-Send revision, recipe, expected result, actual evidence, and source references to the patch agent. Start with two attempts plus explicit time and cost limits. Stop on no progress, repeated failure, changed intent, or blocked prerequisites.
+A rerun covers the selected checks plus a small required smoke set, and
+widens for shared configuration, dependencies, schemas, or uncertain impact.
+Periodic full runs estimate what selection misses. Repository policy gates
+merges, not report wording.
 
-Protect the comparator, expectations, baselines, and evidence writer from silent changes by the patch agent. A fix creates a new run under the same checks. Imported agent claims remain imported until controlled execution validates them.
+### Pinned base
 
-Rerun selected checks plus a small required smoke set. Widen for shared configuration, dependencies, schemas, or uncertain impact. Periodic full runs estimate what selection misses. Gate merge eligibility through repository policy, not report wording.
+The loop pins the base before it starts the agent. A hook pins it on the first
+`SessionStart` in a worktree. A pin resolves the revision to a commit SHA and
+lives in Observed's state directory outside the repository. Nothing re-pins
+while a pin exists, including `SessionStart` on resume, clear or compaction. A
+person resets it with `observed pin --reset`, which pins the base again and
+records the recipe hashes again. An agent with a shell can run it too, so
+`loop.json` records each reset, and the pull request's job, which ignores the
+pin, still judges the change. The default base is the merge base of `HEAD`
+with the remote's default branch, and `--base` sets another. Revision
+arguments that start with `-` are rejected.
+
+The base's expectations judge every check that the base defines, as
+[PRODUCT.md](PRODUCT.md#altered-checks) describes. `result.json` already marks
+each check whose imported test file changed. After gate 5, recipe differences
+cover every field of `observed.json` (see [Decisions](ROADMAP.md#decisions)).
+
+The loop and the hooks also record the hash of `observed.json` and of each
+imported test file when they pin the base. A later run whose files differ from
+those hashes means the recipe changed since the pin, which in the loop's own
+worktree only the agent can do, and the loop stops with "needs a person". That
+includes a check the agent adds, because only a person accepts a new check.
+The comparison is a stop rule and sets no verdict. A recipe difference that
+the person's changes already held before the loop started does not stop it,
+and the pull request's job judges that difference as usual. In a hook session
+the person and the agent share one worktree, so the hooks cannot tell their
+edits apart. A recipe edit the person makes there also stops with "needs a
+person" until the person resets the pin.
+
+A stub behind an unchanged `start`, such as a changed package script or
+fixture, is a source change, not a recipe difference. The change scope lists
+it, and a pass reads "No regression in the named checks" with the files that
+were not observed, as [PRODUCT.md](PRODUCT.md#change-scope) words it.
+
+### Loop
+
+`observed loop --agent claude|codex|opencode` or `--agent-command <argv>`.
+Running the command is the person's authorization for that loop.
+
+1. Pin the base. Copy the working tree's changes into a new worktree on its
+   own branch. The agent works there, and the person's checkout stays as it
+   is.
+2. Run `observe` into a report directory the loop owns, outside the worktree.
+3. Stop by the table below. Otherwise give `agentText` to the agent as an
+   argument vector without a shell. Like the MCP `evidence` output, the
+   handoff is redacted and labels captured page text as data.
+   - `claude -p --output-format json --permission-mode dontAsk
+     --allowedTools <list>`, on stdin. The list lets print mode edit files
+     and run the named commands without a prompt, and `dontAsk` denies the
+     rest. Without a mode, the run can start in `auto`, where a classifier
+     approves actions the list does not name and a bare `Bash` entry is
+     dropped ([headless](https://code.claude.com/docs/en/headless),
+     checked 2026-10-05).
+   - `codex exec --json -s workspace-write`, on stdin.
+   - `opencode run --file`. The help of opencode 2.0.22 lists no stdin input.
+4. When the agent exits, go back to step 2. The loop records the agent's exit
+   status and last message and never reads them as a verdict.
+
+`claude -p` runs the hooks in the project and user settings unless `--bare`
+is set. So the loop sets `OBSERVED_LOOP` in the agent's environment, and a
+Stop hook the person installed sees it and does nothing.
+
+When the agent runs in a sandbox, the loop keeps the report and state
+directories outside its writable roots. Codex's `workspace-write` can write to
+`/tmp` and `$TMPDIR` unless `sandbox_workspace_write.exclude_slash_tmp` and
+`exclude_tmpdir_env_var` are set
+([configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference),
+checked 2026-10-05). Claude Code's Bash sandbox is opt-in and writes to the
+working directory and a per-user temp directory
+([sandboxing](https://code.claude.com/docs/en/sandboxing), checked
+2026-10-05). That sandbox covers shell commands only. Claude's file tools
+follow permission rules, so the loop's `Edit` entries name the worktree only.
+The report and state directories therefore go under neither the worktree nor
+a temp directory. Without a sandbox, an allowed shell command can reach them.
+`loop.json` records which applied.
+
+The first row that matches decides the stop. The loop's exit codes differ
+from `observe`'s on purpose: a run that checked nothing, `not-checked` or
+`preview`, exits 0 from `observe` and 1 from the loop.
+
+| Stop | Condition | Exit |
+| --- | --- | --- |
+| Cancelled | SIGINT or SIGTERM, such as when the person's intent changed. The loop stops the agent's process group and the capture, and keeps the worktree and reports | 1 |
+| Unknown | A capture, a revision or a prerequisite is unavailable, such as an app that does not start or a missing credential, or the run checked nothing | 1 |
+| Needs a person | `observed.json` or an imported test file changed since the pin | 4 |
+| Flaky | A run passes after a failure with an unchanged snapshot hash, or the confirming rerun fails | 1 |
+| Passed locally | `conclusion.kind` is `no-regression` with at least one check, and a rerun without an edit agrees | 0 |
+| Agent failed | The agent exited nonzero or passed its time limit, and the rerun still fails | 2 |
+| No progress | The snapshot hash did not change, or the same checks failed with the same measured values | 2 |
+| Budget | Two attempts by default, a wall-clock limit, and the agent's cost limit where it takes one, such as `claude -p --max-budget-usd` ([CLI reference](https://code.claude.com/docs/en/cli-reference), checked 2026-10-05) | 2 |
+
+Exit 4 is new. The README's exit code table gains it with the loop. At the
+end the loop prints the branch, and the person merges or discards it.
+
+`loop.json`, next to the reports, holds the pinned base and the protection
+that applied. For each attempt it holds the report directory, snapshot hash,
+conclusion, agent argument vector without environment, agent exit and
+duration. Last comes the stop reason.
+
+### Hooks
+
+`observed hook claude-stop` and `observed hook codex-stop` read the Stop
+hook's JSON on stdin and run `observe` against the pinned base. After a pass
+they run the confirming rerun in the same call. They skip the run when the
+snapshot hash already has a final stop. They use the loop's stop table, and
+block only while the loop would hand the evidence to the agent, with
+`{"decision":"block","reason":...}` and the handoff as the reason. Both agents
+send that reason back to the model ([Claude Code
+hooks](https://code.claude.com/docs/en/hooks), [Codex
+hooks](https://learn.chatgpt.com/docs/hooks), checked 2026-10-05). On any
+other stop they let the turn end, print the stop reason, and add it to the
+worktree's `loop.json`.
+
+The hooks count their own blocks. Claude Code overrides a block after eight
+consecutive continuations, raised with `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`, and
+the count resets each time Claude calls a tool. Codex documents no limit. Both
+default to a 600-second hook timeout. A pass and its confirming rerun take
+four captures per journey, so the hook's timeout must exceed four times the
+journey count times `--timeout`. Codex project hooks need trust through
+`/hooks`. Observed prints the hook entry and the command that adds it, and
+changes an agent's settings only when the person runs that command.
+
+### MCP server
+
+`observed mcp` serves the [Model Context Protocol](https://modelcontextprotocol.io/specification/2025-11-25)
+over stdio, built on `effect/unstable/ai/McpServer` from the pinned `effect`
+release. The module is unstable, so each `effect` update rechecks it. The
+server speaks revisions 2025-11-25 and 2025-06-18, exposes tools only, for
+the reasons in the [decision](ROADMAP.md#decisions), and returns
+`structuredContent` against an output schema with the same JSON as text.
+
+| Tool | Input | Output |
+| --- | --- | --- |
+| `observe` | Project directory; optional `base`, `candidate`, `timeoutMs`, as `observe` takes them | A run handle, plus the `check` output for that run |
+| `check` | Run handle | `conclusion.kind` and the exit code it maps to (0, 1 or 2), the name and verdict of each failed, unknown and altered check, and the base commit. Decoded from `result.json` with `comparisonSchema`; nothing recomputed |
+| `evidence` | Run handle, optional artifact path | The agent handoff from `agentText`, or one artifact that `result.json` references, redacted as for export |
+
+- The server accepts only handles for runs it executed in the same process,
+  and hashes each report when it finishes. A report whose files changed
+  since reads unknown. No tool takes a capture or report directory, so a
+  hand-written `result.json` gets nothing back in Observed's name.
+- The loop and the hooks judge only runs they executed, never an MCP
+  result. A client's `base` and `candidate` change what the agent sees, not
+  what stops a loop.
+- `observe` writes a report and starts processes. `check` and `evidence`
+  only read. The annotations say so, with `destructiveHint` set explicitly,
+  because it defaults to true. Annotations are hints, and Observed relies on
+  none of them.
+- Tool output leaves out the full `result.json`. Claude Code warns at 10,000
+  tokens of MCP output and stops at 25,000 by default
+  ([MCP docs](https://code.claude.com/docs/en/mcp), checked 2026-10-05).
+- `observe` sends a progress notification per capture step when the client
+  passes a progress token. Cancelling interrupts the run, which stops the
+  processes it owns. Codex stops a tool call after 60 seconds by default
+  ([Codex MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli),
+  checked 2026-10-05), below the 120-second default capture timeout, so
+  `observed skill` tells Codex users to raise `tool_timeout_sec`.
+- No tool writes `observed.json` or a baseline. No tool takes a command, a
+  verdict, a check definition or an expectation as input. No output carries
+  environment variables, tokens, or a path outside the report directory.
+- A tool whose parameters or success schema is not an object with at least
+  one key stops the server at startup with `Missing key at ["type"]`
+  (`effect` 4.0.0-rc.117, 2026-10-05).
+
+### CI
+
+In CI the loop runs only when the workflow enables it and a person with write
+access starts it, under the trigger rules in
+[Delivery adapters](#delivery-adapters), and only on pull requests from the
+same repository. The loop's job runs the candidate's code next to the agent's
+credentials and a `GITHUB_TOKEN` that can push, so that code can read them.
+The agent pushes a commit with the job's `GITHUB_TOKEN`. That push starts the
+pull request's workflow runs in an approval-required state, and a person with
+write access starts them
+([GITHUB_TOKEN](https://docs.github.com/en/actions/concepts/security/github_token),
+checked 2026-10-05). That approval is the authorization for each judged run,
+and it keeps the 2026-09-28 decision to need no GitHub App. The pull request's
+job, which holds no agent credentials, judges the commit. Generated journeys
+run as a separate mode with the rules in
+[Generated journeys](#generated-journeys): the agent writes only the journey
+file, and the mode stops at its budget.
+
+### Local results and the CI verdict
+
+A local pass stops the loop or lets the turn end. It never stands in for the
+pull request's job, which reruns on its own runner from the pull request's
+base and carries the verdict. An agent with a shell can reach the state
+directory, the hook configuration and Observed's installation. Claude Code
+applies settings edited during a session, which a `ConfigChange` hook can
+block, and `--bare` skips hooks
+([hooks](https://code.claude.com/docs/en/hooks), [CLI
+reference](https://code.claude.com/docs/en/cli-reference), checked
+2026-10-05). Agents also cheat by special-casing tests, not only by editing
+them ([ImpossibleBench](https://arxiv.org/abs/2510.20270)). The CI run is
+separate from the agent's session. It still runs the candidate's `start`
+command and code. So local results are evidence for the agent, and the CI run
+is the evidence for the merge. A second model's review, an agent's exit 0, or
+its own claim of success never sets a verdict. Imported agent claims stay
+imported until a controlled run checks them.
+
+## Formal results
 
 A formal result must include its statement, assumptions, toolchain, dependencies, and implementation connection. Reject incomplete proofs and unexpected assumptions. Keep model proof and runtime evidence separate; neither substitutes for the other. The implementation connection is its own executed evidence, such as a conformance run of the code against the model's cases. Without it the result reads "model checked, implementation link open" and the overall verdict is unknown.
 
