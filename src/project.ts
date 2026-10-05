@@ -8,17 +8,12 @@ import {
   recipeSchemaVersion,
   stepSchema,
 } from './capture/recipe';
-import { checkSchema } from './checks';
+import { savedCheckSchema } from './checks';
 import { collectorSchema } from './evidence-kinds';
 
-export const relativePathSchema = text.check(
-  Schema.makeFilter(
-    (value) =>
-      !path.isAbsolute(value) &&
-      !/[\\:\p{Cc}]/u.test(value) &&
-      value.split('/').every((part) => !['', '.', '..'].includes(part)),
-  ),
-);
+import { relativePathSchema } from './project-path';
+
+export { relativePathSchema } from './project-path';
 
 export const commandSchema = Schema.NonEmptyArray(text);
 
@@ -27,8 +22,8 @@ export const journeySchema = Schema.Struct({
   path: routeSchema,
   ready: Schema.Array(stepSchema),
   steps: Schema.Array(stepSchema),
-  check: Schema.optionalKey(checkSchema),
-  checks: Schema.optionalKey(Schema.Array(checkSchema)),
+  check: Schema.optionalKey(savedCheckSchema),
+  checks: Schema.optionalKey(Schema.Array(savedCheckSchema)),
   collectors: Schema.optionalKey(Schema.Array(collectorSchema)),
   viewport: Schema.optionalKey(recipeSchema.fields.viewport),
   browserArguments: Schema.optionalKey(Schema.Array(text)),
@@ -187,7 +182,12 @@ export function journeyChecks({
   return checks ?? (check === undefined ? [] : [check]);
 }
 
-function journeyRecipe({ check, checks, collectors, ...fields }: Journey) {
+export function journeyRecipe({
+  check,
+  checks,
+  collectors,
+  ...fields
+}: Journey) {
   const configured = journeyChecks({ check, checks });
 
   return {

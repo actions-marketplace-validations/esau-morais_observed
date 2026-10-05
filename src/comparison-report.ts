@@ -1,3 +1,4 @@
+import { generatedCoverage, savingProposalText } from './generated-proposals';
 import {
   capturedFiles,
   relationLabels,
@@ -355,9 +356,22 @@ function renderJourney(
   ];
   const single = result.journeys.length === 1;
   const comparison = journey.comparison;
+  const coverage = generatedCoverage(journey);
 
   return {
     lead: [
+      ...journey.findings
+        .filter((finding) => finding.evidence === 'text')
+        .map(
+          (finding) =>
+            `Observation: ${escapeText(finding.subject)}. No verdict.`,
+        ),
+      ...(journey.generated === undefined
+        ? []
+        : [
+            `Generated journey · Agent interpretation. ${escapeText(journey.generated.reason)} Targets: ${journey.generated.targets.map(escapeText).join(', ')}. Only executed baseline checks set verdicts. ${escapeText(savingProposalText(journey))}`,
+            ...(coverage === null ? [] : [link('Recorded coverage', coverage)]),
+          ]),
       ...(single
         ? []
         : [
