@@ -113,6 +113,8 @@ function measurement(
 type Edit = { file: string; from: string; to: string };
 export type Pair = {
   expectation: Expectation;
+  fixture?: string;
+  generated?: string;
   edits: readonly Edit[];
   candidateProject?: Project;
 };
@@ -358,6 +360,21 @@ export const pairs: readonly Pair[] = [
         ]),
         expected: 'outside-captured-source',
       },
+      ...(
+        [
+          ['No captured file changed\\.', true],
+          ['1 file changed outside the captured source\\.', true],
+          ['- README\\.md \\(modified\\)', true],
+          ['Checks cover only their stated expectations and scopes', true],
+          ['checks describe unchanged behavior', false],
+          ['verified change', false],
+          ['safe to merge', false],
+        ] as const
+      ).map(([includes, expected]) => ({
+        label: `report wording: ${includes}`,
+        actual: { kind: 'text' as const, file: 'report.md', includes },
+        expected,
+      })),
     ],
   ),
 ];

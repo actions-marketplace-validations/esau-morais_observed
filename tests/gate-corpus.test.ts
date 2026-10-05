@@ -7,6 +7,7 @@ import {
   select,
   type Expectation,
 } from '../scripts/gate-corpus/check';
+import { pairs } from '../scripts/gate-corpus/cases';
 
 const roots: string[] = [];
 
@@ -118,4 +119,149 @@ test('does not silently choose a duplicate check or treat a missing field as nul
     ]),
   ).toThrow('found 2');
   expect(() => select({}, ['missing'])).toThrow('Missing field');
+});
+
+test('outside-source wording rejects missing scope, outside paths, and broader claims', async () => {
+  const root = await fixture();
+  const pair = pairs.find((item) => item.expectation.id === 'outside-source');
+  if (pair === undefined) {
+    throw new Error('Missing outside-source pair');
+  }
+
+  const assertions = pair.expectation.assertions.filter(
+    (assertion) => assertion.actual.kind === 'text',
+  );
+  const [first, ...rest] = assertions;
+  if (first === undefined) {
+    throw new Error('Missing wording expectations');
+  }
+
+  const wording: Expectation = {
+    ...pair.expectation,
+    assertions: [first, ...rest],
+  };
+  const report = [
+    'No captured file changed\\. 1 file changed outside the captured source\\.',
+    '- README\\.md \\(modified\\)',
+    'Checks cover only their stated expectations and scopes\\.',
+  ].join('\n');
+  await writeFile(path.join(root, 'report.md'), report);
+  expect((await checkRun(root, wording, 0)).passed).toBe(true);
+
+  for (const text of [
+    '',
+    'unknown',
+    'incomplete',
+    'not run',
+    'none',
+    ...assertions.flatMap((assertion) =>
+      assertion.actual.kind !== 'text'
+        ? []
+        : [
+            assertion.expected === true
+              ? report.replace(assertion.actual.includes, '')
+              : `${report}\n${assertion.actual.includes}`,
+          ],
+    ),
+  ]) {
+    await writeFile(path.join(root, 'report.md'), text);
+    expect((await checkRun(root, wording, 0)).passed).toBe(false);
+  }
+
+  await rm(path.join(root, 'report.md'));
+  expect((await checkRun(root, wording, 0)).passed).toBe(false);
+  const other = await fixture();
+  await writeFile(path.join(other, 'report.md'), report);
+  await symlink(path.join(other, 'report.md'), path.join(root, 'report.md'));
+  expect((await checkRun(root, wording, 0)).failures.join(' ')).toContain(
+    'outside the run',
+  );
+});
+
+test('requires innermost execution even when the result forges an exercised relation', async () => {
+  const root = await fixture();
+  const source =
+    "document.querySelector('#error').addEventListener('click', () => {\n  throw new Error('Gate 3 invoice detail failed');\n});\n//# sourceMappingURL=gate-3-error.js.map\n";
+  await writeFile(path.join(root, 'source.js'), source);
+  // Range boundaries from trial #17, saved journey, agent-browser 0.38.1/CDP.
+  const script = {
+    url: 'http://localhost:1234/gate-3-error.js',
+    functions: [
+      { ranges: [{ startOffset: 0, endOffset: source.length, count: 1 }] },
+      { ranges: [{ startOffset: 59, endOffset: 119, count: 0 }] },
+    ],
+  };
+  const raw = { result: [script] };
+  await writeFile(path.join(root, 'coverage.json'), JSON.stringify(raw));
+  await writeFile(
+    path.join(root, 'result.json'),
+    JSON.stringify({ relation: 'exercised' }),
+  );
+  const coverage: Extract<
+    Expectation['assertions'][number]['actual'],
+    { kind: 'coverage' }
+  > = {
+    kind: 'coverage',
+    file: 'coverage.json',
+    pathname: '/gate-3-error.js',
+    source: 'source.js',
+    line: 2,
+    column: 2,
+    functionRange: { startOffset: 59, endOffset: 119 },
+  };
+  const execution: Expectation = {
+    id: 'raw-coverage',
+    gate: 3,
+    reason:
+      'Outer script execution must not hide an unexecuted changed function.',
+    exitCode: 0,
+    assertions: [
+      {
+        label: 'relation',
+        actual: { kind: 'json', file: 'result.json', path: ['relation'] },
+        expected: 'exercised',
+      },
+      { label: 'changed line', actual: coverage, expected: true },
+    ],
+  };
+  expect((await checkRun(root, execution, 0)).passed).toBe(false);
+  await writeFile(
+    path.join(root, 'coverage.json'),
+    JSON.stringify({
+      result: [{ ...script, functions: script.functions.slice(0, 1) }],
+    }),
+  );
+  expect((await checkRun(root, execution, 0)).passed).toBe(false);
+  await writeFile(path.join(root, 'coverage.json'), JSON.stringify(raw));
+  const saved: Expectation = {
+    ...execution,
+    assertions: [{ label: 'saved line', actual: coverage, expected: false }],
+  };
+  expect((await checkRun(root, saved, 0)).passed).toBe(true);
+  for (const invalid of [
+    { kind: 'unknown' },
+    { result: [] },
+    { kind: 'not-run' },
+    { result: [script, script] },
+    { result: [{ ...script, functions: [] }] },
+    {
+      result: [
+        {
+          ...script,
+          functions: [{ ranges: [{ startOffset: 0, endOffset: 0, count: 1 }] }],
+        },
+      ],
+    },
+    {
+      result: [
+        { ...script, functions: [...script.functions, script.functions[1]] },
+      ],
+    },
+  ]) {
+    await writeFile(path.join(root, 'coverage.json'), JSON.stringify(invalid));
+    expect((await checkRun(root, saved, 0)).passed).toBe(false);
+  }
+
+  await rm(path.join(root, 'coverage.json'));
+  expect((await checkRun(root, saved, 0)).passed).toBe(false);
 });
