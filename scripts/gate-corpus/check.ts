@@ -14,6 +14,29 @@ const positive = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1));
 
 const readingSchema = Schema.Union([
   Schema.Struct({
+    kind: Schema.Literal('png-different'),
+    file: Schema.String,
+    other: Schema.String,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal('timeline-state'),
+    file: Schema.String,
+    side: Schema.Literals(['base', 'candidate']),
+    includes: Schema.NonEmptyString,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal('load-budget'),
+    file: Schema.String,
+    side: Schema.Literals(['base', 'candidate']),
+    check: Schema.NonEmptyString,
+    max: Schema.Number.check(
+      Schema.isFinite(),
+      Schema.isGreaterThanOrEqualTo(0),
+    ),
+    samples: positive,
+    warmup: positive,
+  }),
+  Schema.Struct({
     kind: Schema.Literal('text'),
     file: Schema.String,
     includes: Schema.NonEmptyString,
@@ -26,6 +49,7 @@ const readingSchema = Schema.Union([
     line: positive,
     column: natural,
     functionRange: Schema.Struct({ startOffset: natural, endOffset: positive }),
+    measure: Schema.optionalKey(Schema.Literal('count')),
   }),
   Schema.Struct({
     kind: Schema.Literal('json'),
@@ -112,7 +136,7 @@ export function select(
   return current;
 }
 
-async function readContainedText(root: string, filename: string) {
+async function readContainedFile(root: string, filename: string) {
   const directory = await realpath(root);
   const resolved = await realpath(path.resolve(directory, filename));
   const relative = path.relative(directory, resolved);
@@ -121,7 +145,11 @@ async function readContainedText(root: string, filename: string) {
     throw new Error(`Reading outside the run is forbidden: ${filename}`);
   }
 
-  return readFile(resolved, 'utf8');
+  return readFile(resolved);
+}
+
+async function readContainedText(root: string, filename: string) {
+  return (await readContainedFile(root, filename)).toString('utf8');
 }
 
 const harSchema = Schema.Struct({
@@ -229,10 +257,32 @@ function covered(
     throw new Error('Missing or ambiguous innermost coverage range');
   }
 
-  return inner[0].count > 0;
+  return reading.measure === 'count' ? inner[0].count : inner[0].count > 0;
 }
 
 async function read(root: string, reading: Reading) {
+  if (reading.kind === 'png-different') {
+    const images = await Promise.all(
+      [reading.file, reading.other].map((file) =>
+        readContainedFile(root, file),
+      ),
+    );
+    const [before, after] = images;
+    if (
+      before === undefined ||
+      after === undefined ||
+      images.some(
+        (bytes) =>
+          bytes.length < 33 ||
+          bytes.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a',
+      )
+    ) {
+      throw new Error('Expected two PNG artifacts');
+    }
+
+    return !before.equals(after);
+  }
+
   if (reading.kind === 'text') {
     return (await readContainedText(root, reading.file)).includes(
       reading.includes,
@@ -240,6 +290,60 @@ async function read(root: string, reading: Reading) {
   }
 
   const value = decodeJson(await readContainedText(root, reading.file));
+
+  if (reading.kind === 'timeline-state') {
+    const side = select(value, ['journeys', 0, reading.side]);
+    const timeline = Schema.decodeUnknownSync(
+      Schema.Struct({
+        steps: Schema.Array(
+          Schema.Struct({
+            index: natural,
+            action: Schema.NonEmptyString,
+            outcome: Schema.Literal('completed'),
+          }),
+        ),
+        finalState: Schema.Struct({
+          kind: Schema.Literal('recorded'),
+          tree: Schema.NonEmptyString,
+        }),
+      }),
+    )(recordedEvidence(side, 'timeline'));
+    const recipe = Schema.decodeUnknownSync(
+      Schema.fromJsonString(
+        Schema.Struct({
+          steps: Schema.Array(Schema.Struct({ kind: Schema.NonEmptyString })),
+        }),
+      ),
+    )(await readContainedText(root, `journey-1/${reading.side}/recipe.json`));
+    if (
+      timeline.steps.length !== recipe.steps.length ||
+      timeline.steps.some(
+        (step, index) =>
+          step.index !== index || step.action !== recipe.steps[index]?.kind,
+      )
+    ) {
+      throw new Error('Timeline steps differ from the protected recipe');
+    }
+
+    const state = timeline.finalState;
+    const producer = Schema.decodeUnknownSync(
+      Schema.fromJsonString(
+        Schema.Struct({
+          success: Schema.Literal(true),
+          data: Schema.Struct({ snapshot: Schema.NonEmptyString }),
+        }),
+      ),
+    )(await readContainedText(root, `journey-1/${reading.side}/snapshot.json`));
+    if (state.tree !== producer.data.snapshot) {
+      throw new Error('Timeline state disagrees with the raw snapshot');
+    }
+
+    return state.tree.includes(reading.includes);
+  }
+
+  if (reading.kind === 'load-budget') {
+    return loadBudget(root, value, reading);
+  }
 
   if (reading.kind === 'coverage') {
     const source = await readContainedText(root, reading.source);
@@ -263,6 +367,110 @@ async function read(root: string, reading: Reading) {
   }
 
   return requests.length;
+}
+
+function recordedEvidence(side: Schema.Json, kind: string): Schema.Json {
+  Schema.decodeUnknownSync(Schema.Literal('complete'))(
+    select(side, ['execution']),
+  );
+  const evidence = Schema.decodeUnknownSync(
+    Schema.Struct({ status: Schema.Literal('recorded'), value: Schema.Json }),
+  )(select(side, ['evidence', { key: 'kind', equals: kind }]));
+
+  return evidence.value;
+}
+
+async function loadBudget(
+  root: string,
+  result: Schema.Json,
+  reading: Extract<Reading, { kind: 'load-budget' }>,
+) {
+  const side = select(result, ['journeys', 0, reading.side]);
+  const evidence = recordedEvidence(side, 'performance');
+  const samples = Schema.decodeUnknownSync(Schema.Array(Schema.Json))(
+    select(evidence, ['samples']),
+  );
+  if (
+    samples.length !== reading.samples + reading.warmup ||
+    select(evidence, ['conditions', 'samples']) !== reading.samples ||
+    select(evidence, ['conditions', 'warmup']) !== reading.warmup
+  ) {
+    throw new Error(
+      'Timing sample counts differ from the protected expectation',
+    );
+  }
+
+  const measured: number[] = [];
+  const origins = new Set<number>();
+  const numeric = Schema.Number.check(
+    Schema.isFinite(),
+    Schema.isGreaterThanOrEqualTo(0),
+  );
+  const producer = Schema.Struct({
+    success: Schema.Literal(true),
+    data: Schema.Struct({
+      result: Schema.fromJsonString(
+        Schema.Struct({
+          observer: Schema.Literal(true),
+          timeOrigin: numeric,
+          document: Schema.Literal('/'),
+          load: numeric,
+        }),
+      ),
+    }),
+  });
+  for (const [index, sample] of samples.entries()) {
+    const run = index + 1;
+    const rawFile = `journey-1/${reading.side}/performance/run-${String(run).padStart(2, '0')}.json`;
+    const raw = Schema.decodeUnknownSync(Schema.fromJsonString(producer))(
+      await readContainedText(root, rawFile),
+    ).data.result;
+    if (origins.has(raw.timeOrigin)) {
+      throw new Error('Timing runs reused a document');
+    }
+
+    origins.add(raw.timeOrigin);
+    if (
+      select(sample, ['run']) !== run ||
+      select(sample, ['warmup']) !== index < reading.warmup ||
+      select(sample, ['document']) !== raw.document ||
+      select(sample, ['metrics', 'load']) !== raw.load
+    ) {
+      throw new Error(`Load sample ${run} disagrees with raw producer output`);
+    }
+
+    if (index >= reading.warmup) {
+      measured.push(raw.load);
+    }
+  }
+
+  measured.sort((a, b) => a - b);
+  const upper = measured[Math.floor(measured.length / 2)];
+  const lower = measured[Math.floor((measured.length - 1) / 2)];
+  if (upper === undefined || lower === undefined) {
+    throw new Error('No measured timing samples');
+  }
+
+  const median = (lower + upper) / 2;
+  const check = Schema.decodeUnknownSync(
+    Schema.Struct({
+      outcome: Schema.Literals(['passed', 'failed']),
+      actual: Schema.NonEmptyString,
+    }),
+  )(select(side, ['checks', { key: 'id', equals: reading.check }]));
+  const withinBudget = median <= reading.max;
+  if (check.outcome !== (withinBudget ? 'passed' : 'failed')) {
+    throw new Error('Check outcome disagrees with the raw load budget');
+  }
+
+  const format = (value: number) =>
+    `${value < 10 ? value.toFixed(1) : Math.round(value)} ms`;
+  const summary = `median ${format(median)} over ${measured.length} samples, range ${format(measured[0] ?? median)} to ${format(measured.at(-1) ?? median)}`;
+  if (check.actual !== summary) {
+    throw new Error('Check measurement disagrees with the raw load samples');
+  }
+
+  return withinBudget;
 }
 
 export async function checkRun(

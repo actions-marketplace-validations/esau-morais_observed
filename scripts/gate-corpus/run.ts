@@ -1,9 +1,13 @@
 import { Effect } from 'effect';
-import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { cp, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { checkRun, type Expectation } from './check';
 import { pairs, project, type Pair } from './cases';
 import { generatedPairs } from './generated-cases';
+import { evidencePairs } from './evidence-cases';
+import { browserPairs } from './browser-cases';
+import { observationPair } from './observation-cases';
 import { startupFailurePair } from './missing-cases';
 import { provenance } from './provenance';
 
@@ -51,7 +55,14 @@ await Effect.runPromise(
       throw new Error('Usage: bun run gates NEW_OUTPUT_DIRECTORY [PAIR_ID]');
     }
 
-    const available = [...pairs, ...generatedPairs, startupFailurePair];
+    const available = [
+      ...pairs,
+      ...generatedPairs,
+      ...evidencePairs,
+      ...browserPairs,
+      observationPair,
+      startupFailurePair,
+    ];
     const chosen =
       selected === undefined
         ? available
@@ -93,8 +104,18 @@ await Effect.runPromise(
           recursive: true,
         },
       );
-      if (pair.fixture === undefined) {
-        await writeFile(path.join(fixture, 'observed.json'), json(project));
+      if (pair.baseProject !== undefined || pair.fixture === undefined) {
+        await writeFile(
+          path.join(fixture, 'observed.json'),
+          json(pair.baseProject ?? project),
+        );
+      }
+
+      for (const file of pair.materialize ?? []) {
+        await rename(
+          path.join(fixture, file.from),
+          path.join(fixture, file.to),
+        );
       }
 
       await writeFile(
@@ -178,6 +199,21 @@ await Effect.runPromise(
         'commit',
         '-m',
         'test: pin expectations before capture',
+      );
+      const sha256 = (bytes: Uint8Array) =>
+        createHash('sha256').update(bytes).digest('hex');
+      await writeFile(
+        path.join(directory, 'required-hashes.json'),
+        json({
+          expectation: sha256(
+            await readFile(path.join(directory, 'expected.json')),
+          ),
+          checker: sha256(
+            await readFile(path.join(import.meta.dirname, 'check.ts')),
+          ),
+          tool: sha256(await readFile(path.join(output, 'tool.json'))),
+        }),
+        { flag: 'wx' },
       );
       console.log(
         `Running ${pair.expectation.id}: expected exit ${pair.expectation.exitCode}`,
