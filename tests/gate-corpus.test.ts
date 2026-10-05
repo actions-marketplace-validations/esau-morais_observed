@@ -1,4 +1,11 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, test } from 'vitest';
@@ -10,6 +17,7 @@ import {
 import { pairs } from '../scripts/gate-corpus/cases';
 import { evidencePairs } from '../scripts/gate-corpus/evidence-cases';
 import { browserPairs } from '../scripts/gate-corpus/browser-cases';
+import { coveragePair } from '../scripts/gate-corpus/coverage-cases';
 import { checkRequestFault } from '../scripts/gate-corpus/fault-check';
 import {
   detectedFault,
@@ -428,6 +436,176 @@ test('requires innermost execution even when the result forges an exercised rela
 
   await rm(path.join(root, 'coverage.json'));
   expect((await checkRun(root, saved, 0)).passed).toBe(false);
+});
+
+test('shifted mapping expectations reject forged lines and absent raw execution', async () => {
+  const root = await fixture();
+  const directory = path.join(root, 'journey-1/base');
+  await mkdir(path.join(directory, 'source/public'), { recursive: true });
+  const source = await readFile(
+    path.join(
+      import.meta.dirname,
+      'fixtures/gate-coverage/public/counts.js.txt',
+    ),
+    'utf8',
+  );
+  await writeFile(path.join(directory, 'source/public/counts.js'), source);
+  const [first, ...rest] = coveragePair.expectation.assertions.filter(
+    ({ actual }) =>
+      (actual.kind === 'coverage' && actual.file.includes('/base/')) ||
+      (actual.kind === 'json' &&
+        actual.path[0] === 'changeScope' &&
+        actual.path.includes('lines')),
+  );
+  if (first === undefined) {
+    throw new Error('Missing mapping assertions');
+  }
+
+  const expectation: Expectation = {
+    ...coveragePair.expectation,
+    assertions: [first, ...rest],
+  };
+  const script = {
+    url: 'http://localhost:1234/counts.js',
+    functions: [
+      { ranges: [{ startOffset: 0, endOffset: source.length, count: 1 }] },
+      { ranges: [{ startOffset: 15, endOffset: 56, count: 1 }] },
+      { ranges: [{ startOffset: 58, endOffset: 96, count: 0 }] },
+    ],
+  };
+  const rawPath = path.join(directory, 'coverage-raw.json');
+  await writeFile(rawPath, JSON.stringify({ result: [script] }));
+  const result = async (ran: number[][], notRan: number[][]) => {
+    await writeFile(
+      path.join(root, 'result.json'),
+      JSON.stringify({
+        changeScope: { files: [{ path: 'counts.ts', lines: { ran, notRan } }] },
+      }),
+    );
+
+    return (await checkRun(root, expectation, 0)).passed;
+  };
+
+  expect(await result([[2, 2]], [[6, 6]])).toBe(true);
+  expect(await result([[4, 4]], [[8, 8]])).toBe(false);
+  expect(
+    await result(
+      [
+        [2, 2],
+        [6, 6],
+      ],
+      [],
+    ),
+  ).toBe(false);
+  expect(
+    await result(
+      [],
+      [
+        [2, 2],
+        [6, 6],
+      ],
+    ),
+  ).toBe(false);
+  for (const invalid of [
+    { kind: 'unknown' },
+    { kind: 'incomplete', result: [] },
+    { kind: 'not-run' },
+    { result: [] },
+    { result: [script, script] },
+    { result: [{ ...script, functions: script.functions.slice(0, 1) }] },
+    {
+      result: [
+        {
+          ...script,
+          functions: [
+            script.functions[0],
+            { ranges: [{ startOffset: 15, endOffset: 56, count: 0 }] },
+            script.functions[2],
+          ],
+        },
+      ],
+    },
+    {
+      result: [
+        {
+          ...script,
+          functions: [
+            script.functions[0],
+            script.functions[1],
+            { ranges: [{ startOffset: 58, endOffset: 96, count: 1 }] },
+          ],
+        },
+      ],
+    },
+  ]) {
+    await writeFile(rawPath, JSON.stringify(invalid));
+    expect(await result([[2, 2]], [[6, 6]])).toBe(false);
+  }
+
+  await rm(rawPath);
+  expect(await result([[2, 2]], [[6, 6]])).toBe(false);
+});
+
+test('shifted mapping requires recorded coverage on both sides and for the saved journey', async () => {
+  const root = await fixture();
+  const labels = [
+    'scope recorded',
+    'saved journey coverage recorded',
+    'base coverage recorded',
+    'candidate coverage recorded',
+  ];
+  const [first, ...rest] = coveragePair.expectation.assertions.filter(
+    ({ label }) => labels.includes(label),
+  );
+  if (first === undefined || rest.length !== labels.length - 1) {
+    throw new Error('Missing scope availability assertions');
+  }
+
+  const expectation: Expectation = {
+    ...coveragePair.expectation,
+    assertions: [first, ...rest],
+  };
+  const coverage = { kind: 'coverage', status: 'recorded' };
+  const journey = { journey: 'Load items', kind: 'recorded' };
+  const result = (
+    base: object[] = [coverage],
+    candidate: object[] = [coverage],
+    scope: object[] = [journey],
+  ) => ({
+    changeScope: { kind: 'recorded', coverage: scope },
+    journeys: [
+      { base: { evidence: base }, candidate: { evidence: candidate } },
+    ],
+  });
+  const replacements = (recorded: object, field: string) => [
+    [],
+    [recorded, recorded],
+    [{ ...recorded, [field]: 'unavailable', reason: 'Coverage not available' }],
+  ];
+  const run = async (value: unknown) => {
+    await writeFile(path.join(root, 'result.json'), JSON.stringify(value));
+
+    return (await checkRun(root, expectation, 0)).passed;
+  };
+
+  expect(await run(result())).toBe(true);
+  for (const evidence of replacements(coverage, 'status')) {
+    expect
+      .soft(await run(result(evidence)), JSON.stringify(evidence))
+      .toBe(false);
+    expect
+      .soft(await run(result(undefined, evidence)), JSON.stringify(evidence))
+      .toBe(false);
+  }
+
+  for (const scope of replacements(journey, 'kind')) {
+    expect
+      .soft(
+        await run(result(undefined, undefined, scope)),
+        JSON.stringify(scope),
+      )
+      .toBe(false);
+  }
 });
 
 test('fault expectations reject retained measurements on unknown or not-run sides', async () => {
