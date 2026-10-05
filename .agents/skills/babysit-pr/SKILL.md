@@ -38,7 +38,12 @@ branch and one reviewable slice.
    limit. Model review is not runtime verification.
 4. Fix actionable findings and run applicable checks from `package.json`. Review
    the changed hunks again after fixes. Reuse successful checks only while their
-   inputs and relevant environment remain unchanged.
+   inputs and relevant environment remain unchanged. Before pushing a fix to a
+   claim, status, or rule, search every doc that restates it and fix each copy.
+   When two rounds find the same kind of problem, such as a parser missing
+   another input, fix their shared cause with the smallest change that covers
+   it and add a check that catches the next case. Change the approach only when
+   it cannot meet the contract.
 5. Commit intended paths, push, and open or update the PR with a description
    written as [below](#write-the-pr-description). Run rebase, commit, push, and
    PR creation as separate commands and stop at the first failure; after an
@@ -68,25 +73,40 @@ the case of proper nouns, acronyms, code, paths, commands, and quoted output,
 such as AI, GitHub, React, Slack, and Observed. The title and commits keep their
 Conventional Commit form.
 
-Include:
+Open with the visual that shows the change:
 
-- what changed for people using Observed or working on it, and why. Name the
-  behavior, not each file.
-- evidence: a link to each run, trial PR, screenshot, or artifact, with its
-  result in one line. Use a table only to compare several runs, one short line
-  per row.
-- checks CI does not run, such as instruction-change commands, seeded faults,
-  or browser checks, each with its result in one line.
-- what no check covered, open questions, and any review step that could not
-  run, such as unavailable review agents.
-- review findings that were declined, with the reason, or are still open.
+- a before | after screenshot of the viewer, report, or page it changes.
+- the rendered Observed comment from a trial run.
+- a GIF when the change moves or takes several steps.
+- a `mermaid` diagram for docs, decisions, and flows. When the change
+  alters a flow, show the flow before and after.
+
+Upload images as GitHub attachments, for example with `uploadImage` in
+[github-delivery.ts](../../../scripts/github-delivery.ts). A local evidence path
+is not an attachment; name it only as a location in the maintainer's checkout.
+
+Then write at most 150 words of prose, one line each: what changed for people
+using Observed or working on it, and the evidence, with a link to each run,
+trial PR, or artifact and its result. Use at most two headings: `checks`, for
+checks CI does not run, such as instruction-change commands, seeded faults, or
+browser checks, and `not verified`, for what no check covered, open questions,
+and review steps that could not run. A declined or open review finding is one
+line with its reason.
 
 Leave out what the diff, the commit list, or CI already shows: file-by-file
 narration, lists of test cases, output of checks CI runs, fixed review findings,
-review rounds, process notes, and repeated caveats. Local evidence paths are
-not GitHub attachments; name them only as locations in the maintainer's
-checkout. Length follows the change. A version bump takes a few lines; a new
-evidence kind can take several paragraphs.
+review rounds, process notes, and repeated caveats.
+
+Before creating a PR or changing its body, whether through `gh pr create`,
+`gh pr edit`, or the API, write the body to a file and run the check until it
+passes:
+
+```bash
+bun run check:pr-body body.md
+```
+
+Add `--no-visual` only for release and pin PRs, which change nothing a reader
+can see.
 
 ## Handle feedback as one cycle
 
@@ -109,13 +129,16 @@ placeholder replies. If a shared account's pending review blocks inline
 replies, do not submit or delete that review; post one linked PR comment
 instead of repeating failed calls.
 
-Watch pending checks with `gh pr checks --watch`, then fetch review state again.
-That command does not watch reviews. During an active review session, start an
-actual bounded watcher for new or edited comments, reviews, thread state, and head
-changes. State its interval and duration. Handle events and resume the watch while
-the authorized session remains active. Do not hand off after one quiet fetch.
-If the watch expires, access fails, or the user pauses work, report that it stopped.
-No completed agent or skill keeps watching on its own.
+Watch pending checks with `gh pr checks --watch` as a background command with a
+timeout, then fetch review state again. That command does not watch reviews.
+Wait for child reviews the same way, or end the turn and let their completion
+resume it. Record where the work stands before any wait. During an active review
+session, start an actual bounded watcher for new or edited comments, reviews,
+thread state, and head changes. State its interval and duration. Handle events
+and resume the watch while the authorized session remains active. Do not hand
+off after one quiet fetch. If the watch expires, access fails, or the user
+pauses work, report that it stopped. No completed agent or skill keeps watching
+on its own.
 
 Limit repeated fix/push cycles for the same unresolved failure to three. Report
 the concrete blocker rather than retrying indefinitely or weakening checks.
