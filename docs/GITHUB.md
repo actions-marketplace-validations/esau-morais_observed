@@ -11,6 +11,7 @@ Details of the GitHub Action. The
 | `base` | required | Revision to compare against. Use `${{ github.event.pull_request.base.sha }}`, which stays fixed when the base branch moves or the job is re-run |
 | `candidate` | `HEAD` | Revision to capture. `HEAD` is the merge commit GitHub checks out for the pull request |
 | `timeout` | `120000` | Milliseconds allowed for each capture |
+| `generated` | empty | JSON file with up to three extra journeys, relative to the workspace, even when `project` is a subdirectory. Saved journeys and checks stay unchanged |
 | `artifact-name` | `observed-bundle` | Name of the uploaded bundle. The report page adds `.html`. Give each call its own name when a workflow runs the action more than once, such as in a matrix |
 | `retention-days` | `7` | Days GitHub keeps the artifacts |
 | `github-token` | `${{ github.token }}` | Token that titles the check, posts the comment and stores the screenshot crops it shows |
@@ -27,6 +28,14 @@ the comment with a stale result. On Linux the action installs packages with
 passwordless `sudo`, which GitHub-hosted runners provide. Each journey is its
 own capture of each revision, so raise `timeout-minutes` when you add
 journeys.
+
+To include journeys supplied for this run, write their JSON file before the
+action and pass `generated: evidence/generated.json`. The action passes it to
+`observe --generated`; it does not generate journeys or call an agent. The
+[generated journey contract](ARCHITECTURE.md#generated-journeys) defines the
+budget, target files, and fixed baseline checks. The CLI validates the file;
+an unreadable or invalid file fails the run. Leave the input empty to run only
+the saved journeys.
 
 ## Permissions
 
@@ -59,7 +68,7 @@ before Observed's, pinned by full commit SHA:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - uses: esau-morais/observed@b19393c598268adb68c3d90cdf92f0e683c216ee # v0.2.0-alpha.5
+      - uses: esau-morais/observed@e87389f7c2255a424050d9e75c8f2c332c4fea1f # v0.2.0-alpha.6
 ```
 
 ## Secrets
@@ -68,7 +77,7 @@ A journey that signs in reads its secret from an environment variable, as in
 `{ "env": "LOGIN_PASSWORD" }`. Pass the repository secret to the action step:
 
 ```yaml
-      - uses: esau-morais/observed@b19393c598268adb68c3d90cdf92f0e683c216ee # v0.2.0-alpha.5
+      - uses: esau-morais/observed@e87389f7c2255a424050d9e75c8f2c332c4fea1f # v0.2.0-alpha.6
         env:
           LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
         with:
@@ -203,7 +212,7 @@ update it. The App needs no server or webhook.
 4. Pass both to the action, and keep `checks: write` in `permissions:`.
 
 ```yaml
-      - uses: esau-morais/observed@b19393c598268adb68c3d90cdf92f0e683c216ee # v0.2.0-alpha.5
+      - uses: esau-morais/observed@e87389f7c2255a424050d9e75c8f2c332c4fea1f # v0.2.0-alpha.6
         with:
           project: .
           base: ${{ github.event.pull_request.base.sha }}
