@@ -192,15 +192,6 @@ POST /orders  `}
               <i>x2</i>
               {'           POST /orders  '}
               <b>x1</b>
-              {`
-
-`}
-              <b>[ok]</b>
-              {' button disabled      holds on candidate\n'}
-              <b>[ok]</b>
-              {' one POST /orders     2 -> 1\n'}
-              <i>[~]</i>
-              {'  label text           "Pay" -> "Saving..."'}
             </pre>
             <figcaption className="micro">
               Every view also prints as plain text, so the same evidence fits a terminal, a PR
